@@ -1,0 +1,376 @@
+// =============================================================================
+// ArogyaLink – Prisma Schema (PostgreSQL)
+// Person 3 Responsibility: Patient Records, Follow-Up & Referral Tracking
+// =============================================================================
+// This schema defines the central PostgreSQL database for ArogyaLink.
+// It connects ASHA workers, PHC doctors, hospitals, patients, referrals,
+// and follow-ups into a single unified data layer.
+//
+// Healthcare Flow:
+//   ASHA registers patient
+//     → PHC doctor encounter
+//     → Vitals + Prescription recorded
+//     → Referral created
+//     → Hospital accepts → Patient arrives → Treatment → Follow-up
+//     → Timeline updated at every step
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+// Every user in the system has one of these roles.
+// This drives role-based access control (RBAC) across all APIs.
+enum Role {
+  ASHA            // ASHA worker – registers patients, conducts follow-ups
+  ANM             // Auxiliary Nurse Midwife – field health worker
+  DOCTOR          // PHC doctor – creates encounters, prescriptions, referrals
+  SPECIALIST      // Specialist at a higher facility – handles teleconsultations
+  HOSPITAL_ADMIN  // Manages referral acceptance at the receiving hospital
+  SYSTEM_ADMIN    // Full system access (super admin)
+}
+
+// Biological sex as recorded during patient registration.
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+// The type of clinical encounter a patient has.
+enum EncounterType {
+  PHC_VISIT          // In-person visit at a Primary Health Centre
+  TELECONSULTATION   // Remote consultation with a specialist
+  EMERGENCY          // Emergency visit / escalation
+  FOLLOW_UP_VISIT    // Scheduled follow-up visit
+}
+
+// Tracks where a referral is in its lifecycle.
+// A referral moves forward (or is cancelled/rejected) one step at a time.
+enum ReferralStatus {
+  CREATED              // Referral has been raised by the referring doctor
+  ACCEPTED             // Receiving hospital has accepted the referral
+  REJECTED             // Receiving hospital has rejected the referral
+  PATIENT_ARRIVED      // Patient has physically arrived at the hospital
+  TREATED              // Treatment has been completed
+  FOLLOW_UP_REQUIRED   // Post-treatment follow-up is needed
+  COMPLETED            // Full lifecycle is complete (incl. follow-up if any)
+  CANCELLED            // Referral was cancelled before completion
+}
+
+// How urgently the patient needs to be seen at the receiving facility.
+enum ReferralPriority {
+  LOW        // Routine referral, no urgency
+  MEDIUM     // Should be seen soon
+  HIGH       // Needs prompt attention
+  EMERGENCY  // Life-threatening, immediate action required
+}
+
+// Tracks the lifecycle of a scheduled follow-up task.
+enum FollowUpStatus {
+  PENDING      // Follow-up is scheduled but not yet started
+  IN_PROGRESS  // ASHA/ANM has contacted or is monitoring the patient
+  COMPLETED    // Follow-up done successfully, outcome recorded
+  MISSED       // Patient was not reachable / follow-up did not happen
+  ESCALATED    // Patient reported worsening; routed for clinical review
+  CANCELLED    // Follow-up cancelled (e.g., patient moved or recovered)
+}
+
+// Tracks whether a locally created record has been synced to the server.
+// Used by the sync API to identify records that need uploading.
+enum SyncStatus {
+  PENDING  // Created offline, not yet sent to server
+  SYNCED   // Successfully synced with the central PostgreSQL database
+  FAILED   // Sync was attempted but failed (will retry)
+}
+
+// Every meaningful event in a patient's journey is recorded as a timeline event.
+// This makes the patient's history readable in chronological order.
+enum TimelineEventType {
+  PATIENT_REGISTERED          // ASHA registered the patient
+  ENCOUNTER_CREATED           // A PHC/teleconsult/emergency encounter was created
+  VITALS_RECORDED             // Vitals were recorded (may be independent of encounter)
+  PRESCRIPTION_ISSUED         // Doctor issued a prescription
+  REFERRAL_CREATED            // A referral was raised
+  REFERRAL_ACCEPTED           // Receiving hospital accepted the referral
+  REFERRAL_REJECTED           // Receiving hospital rejected the referral
+  PATIENT_ARRIVED_AT_HOSPITAL // Patient physically arrived at receiving hospital
+  TREATMENT_COMPLETED         // Treatment at hospital was completed
+  FOLLOWUP_SCHEDULED          // A follow-up was scheduled
+  FOLLOWUP_COMPLETED          // Follow-up was completed
+  FOLLOWUP_MISSED             // Follow-up was missed
+  FOLLOWUP_ESCALATED          // Follow-up escalated due to worsening condition
+  EMERGENCY_ESCALATED         // Emergency escalation triggered (Person 5 integration)
+}
+
+// =============================================================================
+// MODELS
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// User – represents any staff member in the ArogyaLink system
+// -----------------------------------------------------------------------------
+// This is the authentication and identity table. It covers ASHA workers,
+// ANMs, doctors, specialists, hospital admins, and system admins.
+model User {
+  id           String   @id @default(cuid())   // Unique internal ID (CUID is URL-safe)
+  name         String                           // Full name of the user
+  phone        String                           // Contact phone number
+  role         Role                             // What this user is allowed to do
+  identifier   String   @unique                 // Official ID: ASHA ID / Doctor ID / Registration No.
+  passwordHash String                           // Bcrypt hashed password (NEVER store plain text)
+  isActive     Boolean  @default(true)          // Soft disable without deleting the account
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Relations – what this user can "own" or be responsible for
+  patientsAssigned Patient[]     @relation("AshaToPatients")  // ASHA's assigned patients
+  encounters       Encounter[]   @relation("DoctorEncounters") // Encounters created by this doctor
+  vitalsRecorded   Vitals[]      @relation("RecordedByUser")   // Vitals recorded by this user
+  prescriptions    Prescription[] @relation("DoctorPrescriptions")
+  referralsCreated Referral[]    @relation("ReferralCreatedBy")
+  referralEvents   ReferralEvent[] @relation("ReferralEventUpdatedBy")
+  followUpsAssigned FollowUp[]   @relation("FollowUpAssignedTo")
+
+  @@map("users") // Maps to snake_case table name in PostgreSQL
+}
+
+// -----------------------------------------------------------------------------
+// Patient – the core record for every patient in the system
+// -----------------------------------------------------------------------------
+// Created when an ASHA worker registers a patient (online or offline).
+// All other records (encounters, referrals, follow-ups) link back to this.
+model Patient {
+  id             String    @id @default(cuid())
+  name           String                          // Patient's full name
+  dateOfBirth    DateTime                        // Used to calculate age
+  gender         Gender                          // MALE / FEMALE / OTHER
+  phone          String?                         // Patient's or guardian's contact (optional)
+  address        String?                         // Full address (optional)
+  village        String                          // Village – important for rural targeting
+  district       String                          // District
+  state          String                          // State
+  assignedAshaId String?                         // FK → users.id (ASHA responsible for patient, optional)
+  syncId         String?   @unique               // Offline dedup key (UUID set by mobile app)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  // Relation: the ASHA worker assigned to this patient
+  assignedAsha   User?         @relation("AshaToPatients", fields: [assignedAshaId], references: [id])
+
+  // One patient → many records across the system
+  encounters     Encounter[]
+  referrals      Referral[]
+  followUps      FollowUp[]
+  timeline       TimelineEvent[]
+  vitals         Vitals[]
+  prescriptions  Prescription[]
+
+  @@index([assignedAshaId]) // Fast lookup: "show me all patients for this ASHA worker"
+  @@map("patients")
+}
+
+// -----------------------------------------------------------------------------
+// Encounter – a single clinical interaction for a patient
+// -----------------------------------------------------------------------------
+// Created by a doctor (or ASHA on behalf of a doctor) when a patient is seen.
+// An encounter is the anchor for vitals, prescriptions, and referrals.
+model Encounter {
+  id            String        @id @default(cuid())
+  patientId     String                             // FK → patients.id
+  doctorId      String?                            // FK → users.id (the treating doctor, optional for ASHA-recorded)
+  facilityId    String?                            // ID of the facility (PHC, hospital, etc.)
+  encounterType EncounterType                      // PHC_VISIT, TELECONSULTATION, etc.
+  symptoms      String[]                           // List of symptoms reported by patient
+  clinicalNotes String?                            // Doctor's notes / findings (free text)
+  encounterDate DateTime                           // When the encounter happened
+  createdAt     DateTime      @default(now())
+
+  // Relations
+  patient       Patient        @relation(fields: [patientId], references: [id])
+  doctor        User?          @relation("DoctorEncounters", fields: [doctorId], references: [id])
+
+  vitals        Vitals[]       // Vitals recorded during this encounter
+  prescriptions Prescription[] // Prescriptions issued during this encounter
+  referrals     Referral[]     // Referrals created from this encounter
+  followUps     FollowUp[]     // Follow-ups linked to this encounter
+
+  @@index([patientId]) // Fast lookup: "show all encounters for this patient"
+  @@index([doctorId])  // Fast lookup: "show all encounters handled by this doctor"
+  @@map("encounters")
+}
+
+// -----------------------------------------------------------------------------
+// Vitals – clinical measurements for a patient
+// -----------------------------------------------------------------------------
+// Can be recorded standalone (by ASHA in the field) or linked to an encounter.
+// Blood pressure is split into systolic and diastolic for proper querying.
+model Vitals {
+  id               String    @id @default(cuid())
+  patientId        String                          // FK → patients.id
+  encounterId      String?                         // FK → encounters.id (optional, may be standalone)
+  temperature      Float?                          // Body temperature in °C
+  heartRate        Int?                            // Beats per minute (bpm)
+  bpSystolic       Int?                            // Blood pressure – systolic  (mmHg)
+  bpDiastolic      Int?                            // Blood pressure – diastolic (mmHg)
+  oxygenSaturation Float?                          // SpO2 percentage (e.g., 98.5)
+  weight           Float?                          // Body weight in kg
+  recordedById     String?                         // FK → users.id (who took the readings, optional)
+  recordedAt       DateTime  @default(now())       // Timestamp of measurement
+
+  // Relations
+  patient          Patient   @relation(fields: [patientId], references: [id])
+  encounter        Encounter? @relation(fields: [encounterId], references: [id])
+  recordedBy       User?     @relation("RecordedByUser", fields: [recordedById], references: [id])
+
+  @@index([patientId])   // "Show all vitals for this patient"
+  @@index([encounterId]) // "Show vitals for this encounter"
+  @@map("vitals")
+}
+
+// -----------------------------------------------------------------------------
+// Prescription – medicines and instructions issued by a doctor
+// -----------------------------------------------------------------------------
+// Medicine details are stored as JSON to support flexible prescription formats
+// (e.g., {name, dosage, frequency, duration} per medicine).
+model Prescription {
+  id              String    @id @default(cuid())
+  patientId       String                          // FK → patients.id
+  encounterId     String?                         // FK → encounters.id (optional)
+  doctorId        String?                         // FK → users.id (prescribing doctor, optional)
+  medicineDetails Json                            // Array of { name, dosage, frequency, duration }
+  instructions    String?                         // Additional instructions (e.g., "take after meals")
+  createdAt       DateTime  @default(now())
+
+  // Relations
+  patient         Patient   @relation(fields: [patientId], references: [id])
+  encounter       Encounter? @relation(fields: [encounterId], references: [id])
+  doctor          User?     @relation("DoctorPrescriptions", fields: [doctorId], references: [id])
+
+  @@index([patientId])   // "Show all prescriptions for this patient"
+  @@index([encounterId]) // "Show prescription for this encounter"
+  @@map("prescriptions")
+}
+
+// -----------------------------------------------------------------------------
+// Referral – tracks a patient being sent from one facility to another
+// -----------------------------------------------------------------------------
+// A referral goes through a well-defined lifecycle managed by ReferralEvent logs.
+// facilityId values are plain strings (can be integrated with a Facility table later).
+model Referral {
+  id                     String          @id @default(cuid())
+  patientId              String                               // FK → patients.id
+  encounterId            String?                              // FK → encounters.id (optional)
+  referringFacilityId    String                               // ID of the PHC/facility sending the referral
+  receivingFacilityId    String                               // ID of the hospital receiving the referral
+  createdById            String?                              // FK → users.id (doctor who raised the referral, optional)
+  reason                 String                               // Clinical reason for referral
+  priority               ReferralPriority                     // LOW / MEDIUM / HIGH / EMERGENCY
+  status                 ReferralStatus  @default(CREATED)    // Current stage in lifecycle
+  acceptedAt             DateTime?                            // When the hospital accepted
+  patientArrivedAt       DateTime?                            // When patient physically arrived
+  treatmentCompletedAt   DateTime?                            // When treatment was marked done
+  requiresFollowUp       Boolean         @default(false)      // Flag: does this referral need a follow-up?
+  createdAt              DateTime        @default(now())
+  updatedAt              DateTime        @updatedAt
+
+  // Relations
+  patient                Patient         @relation(fields: [patientId], references: [id])
+  encounter              Encounter?      @relation(fields: [encounterId], references: [id])
+  createdBy              User?           @relation("ReferralCreatedBy", fields: [createdById], references: [id])
+
+  // Audit log of every status change on this referral
+  events                 ReferralEvent[]
+  // Follow-ups that resulted from this referral
+  followUps              FollowUp[]
+
+  @@index([patientId])   // "Show all referrals for this patient"
+  @@index([encounterId]) // "Show referral created from this encounter"
+  @@index([status])      // "Show all active/pending referrals"
+  @@map("referrals")
+}
+
+// -----------------------------------------------------------------------------
+// ReferralEvent – immutable audit log of every referral status change
+// -----------------------------------------------------------------------------
+// Every time a referral's status changes (e.g., CREATED → ACCEPTED),
+// a new ReferralEvent is appended. This gives a full audit trail.
+model ReferralEvent {
+  id             String         @id @default(cuid())
+  referralId     String                              // FK → referrals.id
+  previousStatus ReferralStatus?                     // What the status was before (null on first event)
+  newStatus      ReferralStatus                      // What the status changed to
+  updatedById    String?                             // FK → users.id (who made this change, optional)
+  remarks        String?                             // Optional note explaining the change
+  createdAt      DateTime       @default(now())
+
+  // Relations
+  referral       Referral       @relation(fields: [referralId], references: [id])
+  updatedBy      User?          @relation("ReferralEventUpdatedBy", fields: [updatedById], references: [id])
+
+  @@index([referralId]) // "Show full history for this referral"
+  @@map("referral_events")
+}
+
+// -----------------------------------------------------------------------------
+// FollowUp – a scheduled check-in task for a patient after treatment
+// -----------------------------------------------------------------------------
+// Created by a doctor after an encounter or referral.
+// Assigned to an ASHA/ANM worker who physically visits or calls the patient.
+// If the patient reports worsening, the status moves to ESCALATED.
+model FollowUp {
+  id                 String         @id @default(cuid())
+  patientId          String                              // FK → patients.id
+  relatedEncounterId String?                             // FK → encounters.id (optional)
+  relatedReferralId  String?                             // FK → referrals.id (optional)
+  assignedToId       String?                             // FK → users.id (ASHA/ANM assigned, optional)
+  dueDate            DateTime                            // When the follow-up should happen
+  status             FollowUpStatus @default(PENDING)    // Current status
+  outcome            String?                             // What happened during the follow-up
+  notes              String?                             // Additional notes by the ASHA worker
+  completedAt        DateTime?                           // When the follow-up was marked complete
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  // Relations
+  patient            Patient        @relation(fields: [patientId], references: [id])
+  relatedEncounter   Encounter?     @relation(fields: [relatedEncounterId], references: [id])
+  relatedReferral    Referral?      @relation(fields: [relatedReferralId], references: [id])
+  assignedTo         User?          @relation("FollowUpAssignedTo", fields: [assignedToId], references: [id])
+
+  @@index([patientId])    // "Show all follow-ups for this patient"
+  @@index([assignedToId]) // "Show all follow-ups assigned to this ASHA worker"
+  @@index([status])       // "Show all pending/missed follow-ups"
+  @@map("followups")
+}
+
+// -----------------------------------------------------------------------------
+// TimelineEvent – chronological history of a patient's healthcare journey
+// -----------------------------------------------------------------------------
+// A new TimelineEvent is appended every time something significant happens
+// (registration, encounter, prescription, referral update, follow-up, etc.).
+// referenceId links to the ID of the relevant record (referral, encounter, etc.)
+// so the frontend can deep-link into the specific record.
+model TimelineEvent {
+  id          String             @id @default(cuid())
+  patientId   String                                   // FK → patients.id
+  eventType   TimelineEventType                        // What kind of event this is
+  referenceId String?                                  // ID of the related record (optional)
+  description String                                   // Human-readable description of the event
+  createdAt   DateTime           @default(now())
+
+  // Relation
+  patient     Patient            @relation(fields: [patientId], references: [id])
+
+  @@index([patientId]) // "Get full timeline for this patient" – sorted by createdAt
+  @@map("timeline_events")
+}
