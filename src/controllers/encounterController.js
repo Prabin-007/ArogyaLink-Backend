@@ -60,13 +60,15 @@ const createEncounter = async (req, res, next) => {
     // doctorId can be explicitly provided, or it defaults to the logged-in doctor/user
     const effectiveDoctorId = doctorId || (req.user && req.user.id ? req.user.id : null);
 
+    // encounterDate defaults to current timestamp if omitted
+    const effectiveEncounterDate = encounterDate ? new Date(encounterDate) : new Date();
+
     // ── Validation ────────────────────────────────────────────────────────────
     const missingFields = [];
     if (!patientId)          missingFields.push('patientId');
     if (!effectiveDoctorId)  missingFields.push('doctorId');
     if (!facilityId)         missingFields.push('facilityId');
     if (!encounterType)      missingFields.push('encounterType');
-    if (!encounterDate)      missingFields.push('encounterDate');
 
     if (missingFields.length > 0) {
       return errorResponse(
@@ -104,7 +106,7 @@ const createEncounter = async (req, res, next) => {
           // symptoms is a String[] in Prisma (PostgreSQL array); default to []
           symptoms:      Array.isArray(symptoms) ? symptoms : [],
           clinicalNotes: clinicalNotes || null,
-          encounterDate: new Date(encounterDate),
+          encounterDate: effectiveEncounterDate,
           lastModifiedById: req.user.id, // who wrote this row (sync uses it for conflict detection)
         },
       });
