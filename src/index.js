@@ -100,6 +100,9 @@ app.use('/api/referrals',     require('./routes/referrals'));
 // ── Follow-Up Management ───────────────────────────────────────────────────────
 app.use('/api/followups',     require('./routes/followups'));
 
+// ── Facility Reference List ────────────────────────────────────────────────────
+app.use('/api/facilities',   require('./routes/facilities'));
+
 // ── Offline Data Synchronization ───────────────────────────────────────────────
 app.use('/api/sync',          require('./routes/sync'));
 
