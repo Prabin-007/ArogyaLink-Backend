@@ -161,6 +161,12 @@ model User {
   referralEvents   ReferralEvent[] @relation("ReferralEventUpdatedBy")
   followUpsAssigned FollowUp[]   @relation("FollowUpAssignedTo")
 
+  // Records this user last wrote (see lastModifiedById on each model)
+  patientsModified   Patient[]   @relation("PatientLastModifiedBy")
+  encountersModified Encounter[] @relation("EncounterLastModifiedBy")
+  vitalsModified     Vitals[]    @relation("VitalsLastModifiedBy")
+  followUpsModified  FollowUp[]  @relation("FollowUpLastModifiedBy")
+
   @@map("users") // Maps to snake_case table name in PostgreSQL
 }
 
@@ -185,11 +191,13 @@ model Patient {
   lmpDate        DateTime?                       // Last menstrual period (pregnancy tracking)
   isHighRisk     Boolean   @default(false)       // Computed on the phone; server only stores it
   riskReasons    String[]                        // e.g. ["BP >= 140/90"] – why isHighRisk is true
+  lastModifiedById String?                       // FK → users.id: who last wrote this row (web or sync). Used by sync to tell a lost-response retry from a real conflict.
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
   // Relation: the ASHA worker assigned to this patient
   assignedAsha   User?         @relation("AshaToPatients", fields: [assignedAshaId], references: [id])
+  lastModifiedBy User?         @relation("PatientLastModifiedBy", fields: [lastModifiedById], references: [id])
 
   // One patient → many records across the system
   encounters     Encounter[]
@@ -219,10 +227,12 @@ model Encounter {
   encounterDate DateTime                           // When the encounter happened
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt                 // Server-side last-write time; used as the sync concurrency token
+  lastModifiedById String?                           // FK → users.id: who last wrote this row (web or sync)
 
   // Relations
   patient       Patient        @relation(fields: [patientId], references: [id])
   doctor        User?          @relation("DoctorEncounters", fields: [doctorId], references: [id])
+  lastModifiedBy User?         @relation("EncounterLastModifiedBy", fields: [lastModifiedById], references: [id])
 
   vitals        Vitals[]       // Vitals recorded during this encounter
   prescriptions Prescription[] // Prescriptions issued during this encounter
@@ -252,11 +262,13 @@ model Vitals {
   recordedById     String?                         // FK → users.id (who took the readings, optional)
   recordedAt       DateTime  @default(now())       // Timestamp of measurement (phone-supplied when synced offline)
   updatedAt        DateTime  @updatedAt            // Server-side last-write time; used as the sync concurrency token
+  lastModifiedById String?                         // FK → users.id: who last wrote this row (web or sync)
 
   // Relations
   patient          Patient   @relation(fields: [patientId], references: [id])
   encounter        Encounter? @relation(fields: [encounterId], references: [id])
   recordedBy       User?     @relation("RecordedByUser", fields: [recordedById], references: [id])
+  lastModifiedBy   User?     @relation("VitalsLastModifiedBy", fields: [lastModifiedById], references: [id])
 
   @@index([patientId])   // "Show all vitals for this patient"
   @@index([encounterId]) // "Show vitals for this encounter"
@@ -367,12 +379,14 @@ model FollowUp {
   completedAt        DateTime?                           // When the follow-up was marked complete
   createdAt          DateTime       @default(now())
   updatedAt          DateTime       @updatedAt
+  lastModifiedById   String?                             // FK → users.id: who last wrote this row (web or sync)
 
   // Relations
   patient            Patient        @relation(fields: [patientId], references: [id])
   relatedEncounter   Encounter?     @relation(fields: [relatedEncounterId], references: [id])
   relatedReferral    Referral?      @relation(fields: [relatedReferralId], references: [id])
   assignedTo         User?          @relation("FollowUpAssignedTo", fields: [assignedToId], references: [id])
+  lastModifiedBy     User?          @relation("FollowUpLastModifiedBy", fields: [lastModifiedById], references: [id])
 
   @@index([patientId])    // "Show all follow-ups for this patient"
   @@index([assignedToId]) // "Show all follow-ups assigned to this ASHA worker"

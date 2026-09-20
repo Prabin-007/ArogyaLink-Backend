@@ -130,6 +130,7 @@ const recordVitals = async (req, res, next) => {
           weight:           weight           !== undefined ? parseFloat(weight)           : null,
           // The authenticated user (ASHA/ANM/Doctor) who took the readings
           recordedById:    req.user.id,
+          lastModifiedById: req.user.id, // who wrote this row (sync uses it for conflict detection)
         },
       });
 

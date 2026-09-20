@@ -145,6 +145,7 @@ const createPatient = async (req, res, next) => {
           ...(lmpDate    ? { lmpDate: new Date(lmpDate) } : {}),
           ...(isHighRisk !== undefined ? { isHighRisk } : {}),
           riskReasons: riskReasons || [],
+          lastModifiedById: req.user.id, // who wrote this row (sync uses it for conflict detection)
         },
       });
 
@@ -286,6 +287,7 @@ const updatePatient = async (req, res, next) => {
     if (lmpDate        !== undefined) updateData.lmpDate        = lmpDate === null ? null : new Date(lmpDate);
     if (isHighRisk     !== undefined) updateData.isHighRisk     = isHighRisk;
     if (riskReasons    !== undefined) updateData.riskReasons    = riskReasons;
+    updateData.lastModifiedById = req.user.id; // who wrote this row (sync uses it for conflict detection)
 
     // Update + (if the patient just became high-risk) the timeline event, atomically.
     const updatedPatient = await prisma.$transaction(async (tx) => {

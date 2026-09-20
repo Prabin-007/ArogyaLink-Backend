@@ -105,6 +105,7 @@ const createEncounter = async (req, res, next) => {
           symptoms:      Array.isArray(symptoms) ? symptoms : [],
           clinicalNotes: clinicalNotes || null,
           encounterDate: new Date(encounterDate),
+          lastModifiedById: req.user.id, // who wrote this row (sync uses it for conflict detection)
         },
       });
 

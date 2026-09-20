@@ -96,6 +96,7 @@ const createFollowUp = async (req, res, next) => {
           dueDate:           dueDateObj,
           status: 'PENDING', // Default status when a follow-up is first created
           notes: notes || null,
+          lastModifiedById: req.user.id, // who wrote this row (sync uses it for conflict detection)
         },
       });
 
@@ -222,6 +223,7 @@ const updateFollowUp = async (req, res, next) => {
     if (status) updateData.status = status;
     if (outcome) updateData.outcome = outcome;
     if (notes) updateData.notes = notes;
+    updateData.lastModifiedById = req.user.id; // who wrote this row (sync uses it for conflict detection)
 
     // If marking as COMPLETED, record the exact completion timestamp
     if (status === 'COMPLETED') {
