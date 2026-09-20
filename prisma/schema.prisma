@@ -52,6 +52,7 @@ enum EncounterType {
   TELECONSULTATION   // Remote consultation with a specialist
   EMERGENCY          // Emergency visit / escalation
   FOLLOW_UP_VISIT    // Scheduled follow-up visit
+  HOME_VISIT         // ASHA/ANM visit to the patient's home (recorded offline on the mobile app)
 }
 
 // Tracks where a referral is in its lifecycle.
@@ -110,6 +111,25 @@ enum TimelineEventType {
   FOLLOWUP_MISSED             // Follow-up was missed
   FOLLOWUP_ESCALATED          // Follow-up escalated due to worsening condition
   EMERGENCY_ESCALATED         // Emergency escalation triggered (Person 5 integration)
+  HIGH_RISK_FLAGGED           // Patient's isHighRisk flag went false → true (riskReasons in description)
+}
+
+// Programme category an ASHA files a patient under (drives which checks she does).
+enum PatientCategory {
+  GENERAL         // Default – no special programme
+  PREGNANT        // Antenatal care tracking (see Patient.lmpDate)
+  CHILD_UNDER_5   // Child health / immunisation tracking
+  NCD             // Non-communicable disease (hypertension, diabetes, ...)
+  ELDERLY         // Elderly care
+}
+
+// Level of the health system a facility belongs to.
+enum FacilityType {
+  SUB_CENTRE
+  PHC
+  CHC
+  DISTRICT_HOSPITAL
+  MEDICAL_COLLEGE
 }
 
 // =============================================================================
@@ -160,7 +180,11 @@ model Patient {
   district       String                          // District
   state          String                          // State
   assignedAshaId String?                         // FK → users.id (ASHA responsible for patient, optional)
-  syncId         String?   @unique               // Offline dedup key (UUID set by mobile app)
+  syncId         String?   @unique               // Legacy offline dedup key. Kept for backward compat; sync v2 sets syncId = id.
+  category       PatientCategory @default(GENERAL) // ASHA programme category
+  lmpDate        DateTime?                       // Last menstrual period (pregnancy tracking)
+  isHighRisk     Boolean   @default(false)       // Computed on the phone; server only stores it
+  riskReasons    String[]                        // e.g. ["BP >= 140/90"] – why isHighRisk is true
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
@@ -194,6 +218,7 @@ model Encounter {
   clinicalNotes String?                            // Doctor's notes / findings (free text)
   encounterDate DateTime                           // When the encounter happened
   createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt                 // Server-side last-write time; used as the sync concurrency token
 
   // Relations
   patient       Patient        @relation(fields: [patientId], references: [id])
@@ -225,7 +250,8 @@ model Vitals {
   oxygenSaturation Float?                          // SpO2 percentage (e.g., 98.5)
   weight           Float?                          // Body weight in kg
   recordedById     String?                         // FK → users.id (who took the readings, optional)
-  recordedAt       DateTime  @default(now())       // Timestamp of measurement
+  recordedAt       DateTime  @default(now())       // Timestamp of measurement (phone-supplied when synced offline)
+  updatedAt        DateTime  @updatedAt            // Server-side last-write time; used as the sync concurrency token
 
   // Relations
   patient          Patient   @relation(fields: [patientId], references: [id])
@@ -250,6 +276,7 @@ model Prescription {
   medicineDetails Json                            // Array of { name, dosage, frequency, duration }
   instructions    String?                         // Additional instructions (e.g., "take after meals")
   createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt            // Lets the mobile download endpoint pick up changed prescriptions
 
   // Relations
   patient         Patient   @relation(fields: [patientId], references: [id])
@@ -373,4 +400,27 @@ model TimelineEvent {
 
   @@index([patientId]) // "Get full timeline for this patient" – sorted by createdAt
   @@map("timeline_events")
+}
+
+// -----------------------------------------------------------------------------
+// Facility – reference list of health facilities (sub-centres, PHCs, hospitals)
+// -----------------------------------------------------------------------------
+// Served to the mobile app so an ASHA can pick a facility offline.
+// NOTE: Referral.referringFacilityId / receivingFacilityId and
+// Encounter.facilityId stay plain strings on purpose (NOT foreign keys) so
+// existing web-portal code that sends free-form facility IDs keeps working.
+model Facility {
+  id        String       @id @default(cuid())
+  name      String
+  type      FacilityType
+  district  String
+  state     String
+  latitude  Float?
+  longitude Float?
+  phone     String?
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  @@index([district]) // "List facilities in this district"
+  @@map("facilities")
 }
