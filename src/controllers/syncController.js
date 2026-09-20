@@ -48,6 +48,22 @@
  *    Every "ok" result returns the record's new `updatedAt` so the phone can
  *    store it as its next baseUpdatedAt. Creates don't need one.
  *
+ *    A "conflict" result also carries `serverRecord` — the server's current
+ *    copy of the row — so the phone can replace its local copy immediately.
+ *
+ *    THE "LOST RESPONSE" CASE. Suppose the phone creates a record, the server
+ *    saves it, but the response never arrives. The phone doesn't know the
+ *    record's updatedAt, so when the ASHA edits it offline and resyncs, it
+ *    sends an existing record WITHOUT baseUpdatedAt. Every row therefore stores
+ *    `lastModifiedById` (who last wrote it, web or sync). With no
+ *    baseUpdatedAt the server decides like this:
+ *        - same content as the server row            → ok (pure retry)
+ *        - different, and lastModifiedById == caller → the caller's own last
+ *          write is what's on the server, so nobody else has touched it:
+ *          apply the edit (still a compare-and-set on the row's current
+ *          updatedAt, so a write racing in between is caught)
+ *        - different, someone else last modified it  → conflict
+ *
  * 5. THE SERVER OWNS THE CLINICAL WORKFLOW. Referrals are created and moved
  *    through their lifecycle only by doctors/specialists/hospital admins on the
  *    web, so they are NOT uploadable from the phone — download only.
@@ -156,33 +172,48 @@ const getAccessiblePatient = async (tx, ctx, patientId) => {
  *
  * @param {string} model       Prisma model delegate name, e.g. 'patient'
  * @param {object} existing    The row as currently stored
- * @param {Date|undefined} baseUpdatedAt  The version the phone edited
+ * @param {Date|undefined} baseUpdatedAt  The version the phone edited (may be absent)
  * @param {object} comparable  Fields the phone is asking to set (compared + written)
  * @param {object} derived     Extra server-computed fields written but NOT compared
  *                             (e.g. completedAt = now), so retries stay idempotent
+ * @param {string} userId      The authenticated user; recorded as lastModifiedById
  * @returns {{kind: 'unchanged'|'updated'|'conflict', row: object, message?: string}}
  */
-const applyOptimisticUpdate = async (tx, model, existing, baseUpdatedAt, comparable, derived = {}) => {
+const applyOptimisticUpdate = async (tx, model, existing, baseUpdatedAt, comparable, derived, userId) => {
   // Nothing to change → the phone's copy already matches the server's.
   if (sameContent(existing, comparable)) {
     return { kind: 'unchanged', row: existing };
   }
 
-  // The record exists but the phone can't say which version it edited.
-  if (!baseUpdatedAt) {
-    return {
-      kind: 'conflict',
-      row: existing,
-      message:
-        'This record already exists on the server with different content. Re-download it and ' +
-        'resend your change with baseUpdatedAt set to the server updatedAt you last received.',
-    };
+  // Which server version is the phone's edit based on?
+  let expectedUpdatedAt = baseUpdatedAt;
+  let requireSameModifier = false;
+
+  if (!expectedUpdatedAt) {
+    if (existing.lastModifiedById === userId) {
+      // Lost-response case: the last write on this row is the caller's own, so
+      // nobody else has touched it. Base the edit on the version we hold now.
+      expectedUpdatedAt = existing.updatedAt;
+      requireSameModifier = true;
+    } else {
+      return {
+        kind: 'conflict',
+        row: existing,
+        message:
+          'This record was changed on the server by someone else and no baseUpdatedAt was sent. ' +
+          'Nothing was overwritten. Replace your local copy with serverRecord and re-apply your change.',
+      };
+    }
   }
 
-  // Atomic compare-and-set: only writes if nobody changed the row since baseUpdatedAt.
+  // Atomic compare-and-set: only writes if nobody changed the row since the expected version.
   const { count } = await tx[model].updateMany({
-    where: { id: existing.id, updatedAt: baseUpdatedAt },
-    data: { ...comparable, ...derived },
+    where: {
+      id: existing.id,
+      updatedAt: expectedUpdatedAt,
+      ...(requireSameModifier ? { lastModifiedById: userId } : {}),
+    },
+    data: { ...comparable, ...derived, lastModifiedById: userId },
   });
 
   const row = await tx[model].findUnique({ where: { id: existing.id } });
@@ -192,16 +223,20 @@ const applyOptimisticUpdate = async (tx, model, existing, baseUpdatedAt, compara
       row,
       message:
         'The server copy changed after the version you edited (baseUpdatedAt no longer matches). ' +
-        'Nothing was overwritten. Re-download this record and re-apply your change.',
+        'Nothing was overwritten. Replace your local copy with serverRecord and re-apply your change.',
     };
   }
   return { kind: 'updated', row };
 };
 
-/** Maps the outcome of a handler to the per-record result body. */
+/**
+ * Maps the outcome of a handler to the per-record result body.
+ * A conflict includes `serverRecord` (the server's current row, same shape as
+ * the download endpoint returns) so the phone can overwrite its local copy.
+ */
 const toOutcome = ({ kind, row, message }) =>
   kind === 'conflict'
-    ? { status: 'conflict', updatedAt: row.updatedAt.toISOString(), message }
+    ? { status: 'conflict', updatedAt: row.updatedAt.toISOString(), message, serverRecord: row }
     : { status: 'ok', updatedAt: row.updatedAt.toISOString() };
 
 // =============================================================================
@@ -241,7 +276,7 @@ const handlePatient = async (tx, rec, ctx) => {
       lmpDate: rec.lmpDate,
       isHighRisk: rec.isHighRisk,
       riskReasons: rec.riskReasons,
-    });
+    }, {}, ctx.user.id);
 
     // Doctors are told about a patient only on the false → true transition.
     if (result.kind === 'updated' && !existing.isHighRisk && result.row.isHighRisk) {
@@ -278,6 +313,7 @@ const handlePatient = async (tx, rec, ctx) => {
       isHighRisk: rec.isHighRisk ?? false,
       riskReasons: rec.riskReasons ?? [],
       createdAt: rec.createdAt, // undefined → now()
+      lastModifiedById: ctx.user.id,
     },
   });
 
@@ -305,7 +341,7 @@ const handleEncounter = async (tx, rec, ctx) => {
       symptoms: rec.symptoms,
       clinicalNotes: rec.clinicalNotes,
       encounterDate: rec.encounterDate,
-    });
+    }, {}, ctx.user.id);
     return toOutcome(result);
   }
 
@@ -324,6 +360,7 @@ const handleEncounter = async (tx, rec, ctx) => {
       symptoms: rec.symptoms ?? [],
       clinicalNotes: rec.clinicalNotes ?? null,
       encounterDate: rec.encounterDate ?? new Date(), // honour the phone's visit time
+      lastModifiedById: ctx.user.id,
     },
   });
 
@@ -352,7 +389,7 @@ const handleVitals = async (tx, rec, ctx) => {
       oxygenSaturation: rec.oxygenSaturation,
       weight: rec.weight,
       recordedAt: rec.recordedAt,
-    });
+    }, {}, ctx.user.id);
     return toOutcome(result);
   }
 
@@ -385,6 +422,7 @@ const handleVitals = async (tx, rec, ctx) => {
       weight: rec.weight ?? null,
       recordedById: ctx.user.id, // always the authenticated user — never trusted from the payload
       recordedAt: rec.recordedAt, // undefined → now(); the phone's time when it sent one
+      lastModifiedById: ctx.user.id,
     },
   });
 
@@ -425,7 +463,8 @@ const handleFollowup = async (tx, rec, ctx) => {
         notes: rec.notes,
         completedAt: rec.completedAt,
       },
-      derived
+      derived,
+      ctx.user.id
     );
 
     // Status moved to COMPLETED / MISSED / ESCALATED → same timeline event as the web PATCH.
@@ -481,6 +520,7 @@ const handleFollowup = async (tx, rec, ctx) => {
       notes: rec.notes ?? null,
       completedAt: rec.completedAt ?? (status === 'COMPLETED' ? new Date() : null),
       createdAt: rec.createdAt,
+      lastModifiedById: ctx.user.id,
     },
   });
 
@@ -595,7 +635,8 @@ const processRecord = async ({ type, schema, handler }, raw, ctx) => {
  *   ok       → saved (or already identical on the server). Store `updatedAt` as the
  *              record's baseUpdatedAt and mark it synced.
  *   conflict → NOT saved; the server copy changed. `updatedAt` is the server's current
- *              version. Re-download, re-apply the user's edit, resend.
+ *              version and `serverRecord` is the server's full current row. Replace the
+ *              local copy with it, re-apply the user's edit, resend.
  *   error    → NOT saved; `message` says why (validation, ownership, missing parent...).
  *
  * @requires Auth: ASHA or ANM
