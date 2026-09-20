@@ -8,6 +8,25 @@ This module is seamlessly integrated with the existing Referral Lifecycle engine
 
 ---
 
+## 🔄 Supported Frontend Workflows
+
+The API is designed to be highly flexible, supporting two distinct user experiences depending on how your frontend integrates with it:
+
+### Workflow 1: System Auto-Creates (1-Step Process)
+Designed for speed and automated routing (e.g., emergencies).
+1. The frontend calls `POST /api/referrals` with patient coordinates and medical needs, but **omits** the `receivingFacilityId`.
+2. The backend AI calculates the best facility and **automatically creates the referral** assigning the patient to that facility in a single step.
+3. The response includes the created referral alongside the AI's explanation so the doctor knows where the patient was routed.
+
+### Workflow 2: Doctor Reviews & Selects (2-Step Process)
+Designed for when the doctor needs the final say (e.g., standard out-patient care).
+1. The frontend calls `POST /api/facilities/recommend` with the patient's data.
+2. The backend returns a ranked list of recommended facilities, but **does not** create a referral.
+3. The UI displays this ranked list. The doctor reviews the AI's reasons and manually clicks to select a facility (even if it's the 2nd or 3rd best).
+4. The frontend calls `POST /api/referrals` providing that specific `receivingFacilityId`. The backend bypasses the AI and creates the direct referral.
+
+---
+
 ## 🧠 The AI Matching Algorithm
 
 The Smart Referral Engine uses a 3-Phase approach to score and rank facilities.
