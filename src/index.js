@@ -96,6 +96,7 @@ app.use('/api/prescriptions', require('./routes/prescriptions'));
 
 // ── Referral Tracking ──────────────────────────────────────────────────────────
 app.use('/api/referrals',     require('./routes/referrals'));
+app.use('/api/facilities',    require('./routes/facilities'));
 
 // ── Follow-Up Management ───────────────────────────────────────────────────────
 app.use('/api/followups',     require('./routes/followups'));
