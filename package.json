@@ -8,7 +8,10 @@
     "dev": "nodemon src/index.js",
     "db:migrate": "prisma migrate dev",
     "db:generate": "prisma generate",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "db:deploy": "prisma migrate deploy",
+    "db:seed": "prisma db seed",
+    "test": "node test/sync.test.js"
   },
   "keywords": ["arogyalink", "health", "backend", "api"],
   "author": "ArogyaLink Team",
@@ -26,5 +29,8 @@
   "devDependencies": {
     "nodemon": "^3.1.4",
     "prisma": "^5.14.0"
+  },
+  "prisma": {
+    "seed": "node prisma/seed.js"
   }
 }
