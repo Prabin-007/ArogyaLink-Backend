@@ -28,6 +28,9 @@
  *   H  server-created (cuid) patients / follow-ups can be synced against
  *   I  input rules: new records need UUIDs; referrals/prescriptions are rejected
  *   J  facilities endpoint + role guards + download parameter validation
+ *   K  lost response: create ok, response lost, edit offline, resend WITHOUT baseUpdatedAt → ok, edit applied
+ *      (lastModifiedById == caller)
+ *   L  a doctor edits the record, then the ASHA resends a stale version → conflict, serverRecord included
  */
 
 require('dotenv').config();
@@ -224,6 +227,11 @@ const run = async () => {
   check('follow-up with a past dueDate accepted, assigned to the ASHA',
     dbFu && dbFu.assignedToId === asha1.id && dbFu.status === 'PENDING');
 
+  check('lastModifiedById = the syncing ASHA on all four created rows',
+    dbPatient.lastModifiedById === asha1.id && dbEnc.lastModifiedById === asha1.id &&
+    dbVit.lastModifiedById === asha1.id && dbFu.lastModifiedById === asha1.id,
+    [dbPatient.lastModifiedById, dbEnc.lastModifiedById, dbVit.lastModifiedById, dbFu.lastModifiedById]);
+
   const updatedAtAfterA = {
     patient: findResult(a, 'patient', P).updatedAt,
     vitals: findResult(a, 'vitals', V).updatedAt,
@@ -313,6 +321,8 @@ const run = async () => {
   const e1r = findResult(e1, 'patient', P);
   check('wrong baseUpdatedAt → status "conflict"', e1r && e1r.status === 'conflict', e1r);
   check('conflict result returns the server\'s current updatedAt', e1r && e1r.updatedAt === U0, e1r);
+  check('conflict result includes serverRecord (the server\'s current row)',
+    e1r && e1r.serverRecord && e1r.serverRecord.id === P && e1r.serverRecord.updatedAt === U0 && e1r.serverRecord.phone === null, e1r);
   check('conflict wrote nothing', (await prisma.patient.findUnique({ where: { id: P } })).phone === null);
 
   const e2 = await upload(asha1.token, { patients: [{ id: P, phone: '9111111111', baseUpdatedAt: U0 }] });
@@ -326,16 +336,22 @@ const run = async () => {
   check('re-using the OLD baseUpdatedAt → conflict', findResult(e3, 'patient', P).status === 'conflict', e3.data.results);
   check('...and the newer value survives', (await prisma.patient.findUnique({ where: { id: P } })).phone === '9111111111');
 
-  const e4 = await upload(asha1.token, { patients: [{ id: P, phone: '9333333333' }] });
-  const e4r = findResult(e4, 'patient', P);
-  check('existing record + different content + NO baseUpdatedAt → conflict', e4r && e4r.status === 'conflict' && /baseUpdatedAt/.test(e4r.message), e4r);
+  check('the ASHA\'s own write is recorded: lastModifiedById = ASHA', (await prisma.patient.findUnique({ where: { id: P } })).lastModifiedById === asha1.id);
 
   // Doctor edits the same patient on the web while the ASHA is offline.
   const webEdit = await api('PUT', `/api/patients/${P}`, doctor.token, { village: 'Mulshi' });
   check('doctor edits the patient on the web (200)', webEdit.status === 200, webEdit.body);
+  check('web write records lastModifiedById = the doctor', (await prisma.patient.findUnique({ where: { id: P } })).lastModifiedById === doctor.id);
+
+  const e4 = await upload(asha1.token, { patients: [{ id: P, phone: '9333333333' }] });
+  const e4r = findResult(e4, 'patient', P);
+  check('existing + different content + NO baseUpdatedAt + someone ELSE modified it → conflict',
+    e4r && e4r.status === 'conflict' && /baseUpdatedAt/.test(e4r.message) && e4r.serverRecord && e4r.serverRecord.village === 'Mulshi', e4r);
   const e5 = await upload(asha1.token, { patients: [{ id: P, address: 'Ward 4', baseUpdatedAt: U1 }] });
   check('ASHA edit based on the pre-doctor version → conflict (doctor\'s edit not overwritten)',
     findResult(e5, 'patient', P).status === 'conflict' && (await prisma.patient.findUnique({ where: { id: P } })).village === 'Mulshi');
+  check('...and the phone\'s stale change (phone 9333333333) was not applied',
+    (await prisma.patient.findUnique({ where: { id: P } })).phone === '9111111111');
   const freshPatient = (await download(asha1.token, t0)).data.patients.find((p) => p.id === P);
   const e6 = await upload(asha1.token, { patients: [{ id: P, address: 'Ward 4', baseUpdatedAt: freshPatient.updatedAt }] });
   check('after re-downloading, the same edit with the fresh updatedAt → ok', findResult(e6, 'patient', P).status === 'ok', e6.data.results);
@@ -482,6 +498,105 @@ const run = async () => {
   const latest = await download(asha1.token, (await download(asha1.token, '0')).data.serverTimestamp);
   check('download with an up-to-date lastSyncedAt returns nothing new',
     latest.data.patients.length === 0 && latest.data.encounters.length === 0 && latest.data.vitals.length === 0 && latest.data.referrals.length === 0 && latest.data.followups.length === 0);
+
+  // ── K ──────────────────────────────────────────────────────────────────────
+  section('K. Lost response: create succeeded, response never arrived, ASHA edited offline, resend WITHOUT baseUpdatedAt');
+  const PK = randomUUID(), EK = randomUUID(), VK = randomUUID(), FK = randomUUID();
+  createdPatientIds.add(PK);
+  const kPatient = { id: PK, name: 'Lost Response', dateOfBirth: '1992-07-07', gender: 'FEMALE', village: 'Velhe', district: 'Pune', state: 'Maharashtra', phone: '9000000000', isHighRisk: false };
+  const kEnc = { id: EK, patientId: PK, encounterType: 'HOME_VISIT', clinicalNotes: 'first draft' };
+  const kVit = { id: VK, patientId: PK, encounterId: EK, bpSystolic: 118, bpDiastolic: 76 };
+  const kFu = { id: FK, patientId: PK, dueDate: daysAgo(-3), notes: 'first draft' };
+
+  const k1 = await upload(asha1.token, { patients: [kPatient], encounters: [kEnc], vitals: [kVit], followups: [kFu] });
+  check('original create → all ok (we now pretend this response was lost: the phone has no updatedAt)',
+    k1.data.results.length === 4 && k1.data.results.every((r) => r.status === 'ok'), k1.data.results);
+  const kUpdatedAt1 = findResult(k1, 'patient', PK).updatedAt;
+
+  // The ASHA edits everything locally. The app still believes all four rows are unsynced creates,
+  // so it resends the FULL rows with the edits and no baseUpdatedAt.
+  const k2 = await upload(asha1.token, {
+    patients: [{ ...kPatient, phone: '9555555555', isHighRisk: true, riskReasons: ['Edited offline: BP high'] }],
+    encounters: [{ ...kEnc, clinicalNotes: 'edited offline', symptoms: ['fever'] }],
+    vitals: [{ ...kVit, bpSystolic: 132, bpDiastolic: 86 }],
+    followups: [{ ...kFu, status: 'COMPLETED', outcome: 'Visited, doing well', notes: 'edited offline' }],
+  });
+  check('resend with edits and NO baseUpdatedAt → all ok', k2.data.results.length === 4 && k2.data.results.every((r) => r.status === 'ok'), k2.data.results);
+  const kP = await prisma.patient.findUnique({ where: { id: PK } });
+  const kE = await prisma.encounter.findUnique({ where: { id: EK } });
+  const kV = await prisma.vitals.findUnique({ where: { id: VK } });
+  const kF = await prisma.followUp.findUnique({ where: { id: FK } });
+  check('the edits WERE applied (patient, encounter, vitals, follow-up)',
+    kP.phone === '9555555555' && kP.isHighRisk === true &&
+    kE.clinicalNotes === 'edited offline' && kE.symptoms[0] === 'fever' &&
+    kV.bpSystolic === 132 && kV.bpDiastolic === 86 &&
+    kF.status === 'COMPLETED' && kF.outcome === 'Visited, doing well' && kF.completedAt !== null,
+    { kP: kP.phone, kE: kE.clinicalNotes, kV: kV.bpSystolic, kF: kF.status });
+  check('new updatedAt returned and it differs from the create\'s', findResult(k2, 'patient', PK).updatedAt !== kUpdatedAt1);
+  check('lastModifiedById is still the ASHA', kP.lastModifiedById === asha1.id && kF.lastModifiedById === asha1.id);
+  const tlK = await timelineTypes(asha1.token, PK);
+  check('timeline: each creation event exactly once (no duplicates from the resend)',
+    ['PATIENT_REGISTERED', 'ENCOUNTER_CREATED', 'VITALS_RECORDED', 'FOLLOWUP_SCHEDULED'].every((t) => count(tlK.types, t) === 1), tlK.types);
+  check('timeline: the offline edits raised HIGH_RISK_FLAGGED and FOLLOWUP_COMPLETED once each',
+    count(tlK.types, 'HIGH_RISK_FLAGGED') === 1 && count(tlK.types, 'FOLLOWUP_COMPLETED') === 1, tlK.types);
+
+  const k3 = await upload(asha1.token, {
+    patients: [{ ...kPatient, phone: '9555555555', isHighRisk: true, riskReasons: ['Edited offline: BP high'] }],
+  });
+  check('sending that same edit AGAIN is a pure retry → ok, updatedAt unchanged',
+    findResult(k3, 'patient', PK).status === 'ok' && findResult(k3, 'patient', PK).updatedAt === findResult(k2, 'patient', PK).updatedAt, k3.data.results);
+
+  const k4 = await upload(asha2.token, { patients: [{ ...kPatient, phone: '9777777777' }] });
+  check('the rule does not let ANOTHER ASHA in (ownership still enforced) → error', findResult(k4, 'patient', PK).status === 'error', k4.data.results);
+
+  // ── L ──────────────────────────────────────────────────────────────────────
+  section('L. A doctor edits the record, then the ASHA resends a stale version → conflict with serverRecord');
+  const PL = randomUUID(), FL = randomUUID();
+  createdPatientIds.add(PL);
+  const lPatient = { id: PL, name: 'Doctor Edits', dateOfBirth: '1988-08-08', gender: 'MALE', village: 'Bhor', district: 'Pune', state: 'Maharashtra' };
+  const lFu = { id: FL, patientId: PL, dueDate: daysAgo(-2), notes: 'ASHA note' };
+  const l1 = await upload(asha1.token, { patients: [lPatient], followups: [lFu] });
+  check('ASHA creates a patient and a follow-up → ok', l1.data.results.every((r) => r.status === 'ok'), l1.data.results);
+  const lBaseP = findResult(l1, 'patient', PL).updatedAt;
+  const lBaseF = findResult(l1, 'followup', FL).updatedAt;
+
+  const dp = await api('PUT', `/api/patients/${PL}`, doctor.token, { village: 'Mulshi', address: 'Doctor-corrected address' });
+  const df = await api('PATCH', `/api/followups/${FL}`, doctor.token, { notes: 'Doctor note' });
+  check('doctor edits the patient and the follow-up on the web', dp.status === 200 && df.status === 200, [dp.body, df.body]);
+
+  // (1) stale, no baseUpdatedAt — someone else (the doctor) is now the last modifier
+  const l2 = await upload(asha1.token, { patients: [{ ...lPatient, phone: '9666666666' }] });
+  const l2r = findResult(l2, 'patient', PL);
+  check('stale resend WITHOUT baseUpdatedAt → conflict', l2r && l2r.status === 'conflict', l2r);
+  check('conflict includes serverRecord with the DOCTOR\'s changes',
+    l2r && l2r.serverRecord && l2r.serverRecord.id === PL && l2r.serverRecord.village === 'Mulshi' &&
+    l2r.serverRecord.address === 'Doctor-corrected address' && l2r.serverRecord.lastModifiedById === doctor.id, l2r);
+  check('result.updatedAt equals serverRecord.updatedAt (the version to build on)', l2r && l2r.updatedAt === l2r.serverRecord.updatedAt, l2r);
+  check('the phone\'s stale change was NOT applied', (await prisma.patient.findUnique({ where: { id: PL } })).phone === null);
+
+  // (2) stale WITH the old baseUpdatedAt
+  const l3 = await upload(asha1.token, { patients: [{ id: PL, phone: '9666666666', baseUpdatedAt: lBaseP }] });
+  const l3r = findResult(l3, 'patient', PL);
+  check('stale resend WITH the old baseUpdatedAt → conflict + serverRecord', l3r && l3r.status === 'conflict' && l3r.serverRecord && l3r.serverRecord.village === 'Mulshi', l3r);
+
+  // (3) same for a follow-up
+  const l4 = await upload(asha1.token, { followups: [{ id: FL, status: 'COMPLETED', notes: 'ASHA final note', baseUpdatedAt: lBaseF }] });
+  const l4r = findResult(l4, 'followup', FL);
+  check('stale follow-up edit → conflict; serverRecord carries the doctor\'s note',
+    l4r && l4r.status === 'conflict' && l4r.serverRecord && l4r.serverRecord.notes === 'Doctor note' && l4r.serverRecord.status === 'PENDING', l4r);
+  check('...and nothing was overwritten', (await prisma.followUp.findUnique({ where: { id: FL } })).notes === 'Doctor note');
+
+  // serverRecord has exactly the shape the download endpoint returns.
+  const dlL = (await download(asha1.token, '0')).data.patients.find((p) => p.id === PL);
+  check('serverRecord has the same fields as a downloaded patient',
+    JSON.stringify(Object.keys(l2r.serverRecord).sort()) === JSON.stringify(Object.keys(dlL).sort()));
+
+  // Recovery: the phone replaces its local copy with serverRecord, re-applies the edit on top, resends.
+  const l5 = await upload(asha1.token, { patients: [{ id: PL, phone: '9666666666', baseUpdatedAt: l2r.serverRecord.updatedAt }] });
+  const l5r = findResult(l5, 'patient', PL);
+  const lNow = await prisma.patient.findUnique({ where: { id: PL } });
+  check('recovery: re-apply on top of serverRecord using its updatedAt → ok',
+    l5r && l5r.status === 'ok' && lNow.phone === '9666666666' && lNow.village === 'Mulshi' && lNow.lastModifiedById === asha1.id, l5r);
 };
 
 // ─── Main ─────────────────────────────────────────────────────────────────────

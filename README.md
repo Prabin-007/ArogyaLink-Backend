@@ -413,8 +413,14 @@ Phone clocks drift, so the server **never compares a phone timestamp to a server
 * To **edit an existing record**, send it back as `baseUpdatedAt` — "this is the version I edited".
 * The server applies the edit only if the row is still at that version (`UPDATE … WHERE id = ? AND updatedAt = baseUpdatedAt` — one atomic statement, no race). If someone else (a doctor on the web, another phone) changed it meanwhile, nothing is overwritten and the result is `"conflict"`.
 * **Creates don't need `baseUpdatedAt`.**
-* On `conflict`: re-download the record (`GET /api/sync/download`), re-apply the user's change to the fresh copy, resend with the fresh `updatedAt`.
-* Sending an existing record **without** `baseUpdatedAt` is only accepted if it is identical to the server copy (that is what makes a retried create safe); otherwise it is a `conflict`.
+* On `conflict`: the result carries **`serverRecord`** — the server's current copy of the row (same fields as the download endpoint). Replace your local copy with it, re-apply the user's change on top, and resend with `baseUpdatedAt` = `serverRecord.updatedAt`.
+* **Lost responses.** If a create succeeded but the response never arrived, the phone has no `updatedAt` for that record, so a later offline edit is sent **without** `baseUpdatedAt`. Every row stores `lastModifiedById` (who last wrote it, from the web or from sync), and for an existing record with no `baseUpdatedAt` the server decides:
+
+| Situation | Result |
+|-----------|--------|
+| Same content as the server row (a plain retry) | `ok`, nothing rewritten |
+| Different content, and `lastModifiedById` is **you** (nobody else has touched it since your own write) | the edit is **applied**, `ok` (still a compare-and-set on the row's current `updatedAt`, so a write racing in between is caught) |
+| Different content, and **someone else** last modified it | `conflict` (+ `serverRecord`) |
 
 Rules that stay server-authoritative: **referral status** (only doctors/hospitals move it), and any field an ASHA is not allowed to edit is simply ignored.
 
@@ -502,7 +508,7 @@ Response:
 | `status` | Meaning | What the app does |
 |----------|---------|-------------------|
 | `ok` | Saved, **or** the server already had exactly this content. `updatedAt` = the record's current server version | Mark synced; store `updatedAt` as `baseUpdatedAt` |
-| `conflict` | **Not saved** — the server copy changed after the version you edited. `updatedAt` = the server's current version | Re-download, re-apply the edit, resend |
+| `conflict` | **Not saved** — the server copy changed after the version you edited. `updatedAt` = the server's current version, `serverRecord` = the server's full current row | Replace the local copy with `serverRecord`, re-apply the edit, resend with `baseUpdatedAt = serverRecord.updatedAt` |
 | `error` | **Not saved** — `message` says why (validation, not your patient, missing parent, uploading a referral…) | Fix the data or surface it; don't retry unchanged |
 
 The HTTP status is `200` whenever the request itself was valid, even if individual records failed — read `results`. It is `400` for a malformed envelope (no `deviceId`, `records` not an object), `401` for no/invalid token, `403` for the wrong role.
