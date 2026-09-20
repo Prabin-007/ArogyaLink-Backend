@@ -9,8 +9,8 @@ Here is how all 6 team members interconnect with **Person 3's Central Continuity
 ```mermaid
 flowchart TD
     subgraph P1["📱 Person 1: ASHA / ANM Mobile App"]
-        P1_App["React Native / Flutter App"]
-        P1_SQLite["Offline SQLite DB"]
+        P1_App["Native Android App<br/>(Kotlin, Room, WorkManager)"]
+        P1_SQLite["Offline Room (SQLite) DB"]
         P1_App -->|Store Offline| P1_SQLite
     end
 
@@ -71,7 +71,7 @@ pie title Person 3 Backend Readiness
 - [x] **Smart Auto-Timeline Engine:** Every patient interaction automatically creates an audit-logged chronological timeline.
 - [x] **Referral Lifecycle Pipeline:** `CREATED` ➔ `ACCEPTED` ➔ `PATIENT_ARRIVED` ➔ `TREATED` ➔ `COMPLETED`.
 - [x] **Follow-up Management:** Scheduling, assigning, tracking overdue status, logging clinical outcomes.
-- [x] **Offline Schema:** `sqlite/schema.sql` created for Person 1's mobile app.
+- [x] **Mobile Sync Contract:** `POST /api/sync/upload` / `GET /api/sync/download` (client-generated UUID ids, per-record results, optimistic concurrency via `baseUpdatedAt`). The Android app defines its own Room schema; the README sync section is the contract.
 - [x] **Developer Bypass Mode:** `AUTH_ENABLED=false` allowing teammates to test freely without login barriers.
 - [x] **Automated Dev User Seeding:** Prevents foreign key constraint errors during testing.
 
@@ -86,7 +86,7 @@ pie title Person 3 Backend Readiness
 
 | Teammate | What They Build | Endpoints They Call on Your Backend | Data Flow |
 |---|---|---|---|
-| **Person 1** *(ASHA Mobile)* | Mobile app + offline SQLite | `POST /api/sync/upload`<br>`GET /api/sync/download` | Sends batch offline patient records; downloads updates when internet returns. |
+| **Person 1** *(ASHA Mobile)* | Native Android app (Kotlin, Room, WorkManager) with offline database | `POST /api/sync/upload`<br>`GET /api/sync/download` | Sends batch offline patient records; downloads updates when internet returns. |
 | **Person 2** *(Doctor Portal)* | Web portal for PHC / Teleconsult | `POST /api/encounters`<br>`POST /api/prescriptions`<br>`GET /api/patients/:id/timeline` | Doctor logs diagnosis and medicines; views complete patient medical history. |
 | **Person 4** *(Smart Referral AI)* | ML model finding nearest available beds/facilities | `POST /api/referrals`<br>`GET /api/referrals/:id` | AI calculates best hospital and creates smart referral with priority. |
 | **Person 5** *(Triage / Emergency)* | Triage assessment & emergency triggers | `POST /api/referrals` (priority: `EMERGENCY`)<br>`PATCH /api/followups/:id` (`status: ESCALATED`) | Escalates worsening rural cases directly to higher facilities. |
