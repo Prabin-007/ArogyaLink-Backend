@@ -86,25 +86,44 @@ app.get('/health', (req, res) => {
  * Current routes: (add as you build them)
  */
 // ── Authentication & User Management ──────────────────────────────────────────
-app.use('/api/auth',          require('./routes/auth'));
+const authRoutes = require('./routes/auth');
+app.use('/api/auth', authRoutes);
+app.use('/auth',     authRoutes);
 
 // ── Patient Records, Encounters, Vitals, Prescriptions ────────────────────────
-app.use('/api/patients',      require('./routes/patients'));
-app.use('/api/encounters',    require('./routes/encounters'));
-app.use('/api/vitals',        require('./routes/vitals'));
-app.use('/api/prescriptions', require('./routes/prescriptions'));
+const patientRoutes = require('./routes/patients');
+const encounterRoutes = require('./routes/encounters');
+const vitalsRoutes = require('./routes/vitals');
+const prescriptionRoutes = require('./routes/prescriptions');
+
+app.use('/api/patients',      patientRoutes);
+app.use('/patients',          patientRoutes);
+app.use('/api/encounters',    encounterRoutes);
+app.use('/encounters',        encounterRoutes);
+app.use('/api/vitals',        vitalsRoutes);
+app.use('/vitals',            vitalsRoutes);
+app.use('/api/prescriptions', prescriptionRoutes);
+app.use('/prescriptions',     prescriptionRoutes);
 
 // ── Referral Tracking ──────────────────────────────────────────────────────────
-app.use('/api/referrals',     require('./routes/referrals'));
+const referralRoutes = require('./routes/referrals');
+app.use('/api/referrals',     referralRoutes);
+app.use('/referrals',         referralRoutes);
 
 // ── Follow-Up Management ───────────────────────────────────────────────────────
-app.use('/api/followups',     require('./routes/followups'));
+const followupRoutes = require('./routes/followups');
+app.use('/api/followups',     followupRoutes);
+app.use('/followups',         followupRoutes);
 
 // ── Facility Reference List ────────────────────────────────────────────────────
-app.use('/api/facilities',   require('./routes/facilities'));
+const facilityRoutes = require('./routes/facilities');
+app.use('/api/facilities',   facilityRoutes);
+app.use('/facilities',       facilityRoutes);
 
 // ── Offline Data Synchronization ───────────────────────────────────────────────
-app.use('/api/sync',          require('./routes/sync'));
+const syncRoutes = require('./routes/sync');
+app.use('/api/sync',          syncRoutes);
+app.use('/sync',              syncRoutes);
 
 // ─── 404 Handler ──────────────────────────────────────────────────────────────
 /**
