@@ -53,10 +53,12 @@ Content-Type: application/json
   "patientLongitude": 91.88,
   "requiredService": "CARDIOLOGY",
   "requiredSpecialist": "CARDIOLOGIST",
+  "preferredSpecialistGender": "FEMALE",
   "requiredDiagnostics": ["ECG"]
 }
 ```
 *Notice that `receivingFacilityId` is omitted. The controller will use the AI to determine it.*
+*`preferredSpecialistGender` (optional): Set to "MALE", "FEMALE", or "ANY". The AI will prioritize finding a specialist of the requested gender without compromising critical medical rules.*
 
 ### 2. Preview Recommendation Only
 If you just want to see recommendations before confirming a referral (e.g., for a UI dropdown):
