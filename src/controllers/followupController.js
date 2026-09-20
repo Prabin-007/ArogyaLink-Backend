@@ -20,6 +20,7 @@
 
 const prisma = require('../config/db');
 const { successResponse, errorResponse } = require('../utils/responseHelper');
+const { logFollowUpScheduled, logFollowUpStatusChange } = require('../utils/timeline');
 
 // ─── Valid Follow-up Statuses ─────────────────────────────────────────────────
 // Must match the FollowUpStatus enum in your Prisma schema.
@@ -32,14 +33,8 @@ const VALID_FOLLOWUP_STATUSES = [
   'CANCELLED',
 ];
 
-// ─── Status → Timeline Event Type Mapping ────────────────────────────────────
-// Maps a follow-up status to the correct TimelineEventType for the patient journey.
-// Only statuses that have a meaningful timeline entry are mapped.
-const STATUS_TO_TIMELINE_EVENT = {
-  COMPLETED: 'FOLLOWUP_COMPLETED',
-  MISSED: 'FOLLOWUP_MISSED',
-  ESCALATED: 'FOLLOWUP_ESCALATED',
-};
+// NOTE: the status → TimelineEventType mapping now lives in src/utils/timeline.js
+// so the mobile sync path uses exactly the same one.
 
 // =============================================================================
 // createFollowUp
@@ -105,14 +100,7 @@ const createFollowUp = async (req, res, next) => {
       });
 
       // Step 2: Record this on the patient's timeline
-      await tx.timelineEvent.create({
-        data: {
-          patientId,
-          eventType: 'FOLLOWUP_SCHEDULED',
-          referenceId: newFollowUp.id,
-          description: `Follow-up scheduled. Due: ${dueDateObj.toDateString()}.${effectiveAssignedToId ? ` Assigned to worker ID: ${effectiveAssignedToId}` : ''}`,
-        },
-      });
+      await logFollowUpScheduled(tx, newFollowUp, dueDateObj, effectiveAssignedToId);
 
       return newFollowUp;
     });
@@ -249,23 +237,8 @@ const updateFollowUp = async (req, res, next) => {
       });
 
       // Step 2: Create a timeline event if the new status warrants one
-      const timelineEventType = STATUS_TO_TIMELINE_EVENT[status];
-      if (timelineEventType) {
-        const descriptionMap = {
-          COMPLETED: `Follow-up completed. Outcome: ${outcome || 'Not recorded.'}`,
-          MISSED: `Follow-up was missed. Notes: ${notes || 'No notes.'}`,
-          ESCALATED: `Follow-up escalated — patient may be worsening. Needs clinical review. Notes: ${notes || 'No notes.'}`,
-        };
-
-        await tx.timelineEvent.create({
-          data: {
-            patientId: existingFollowUp.patientId,
-            eventType: timelineEventType,
-            referenceId: id,
-            description: descriptionMap[status],
-          },
-        });
-      }
+      // (helper is a no-op for statuses that have no timeline entry)
+      await logFollowUpStatusChange(tx, existingFollowUp, status, { outcome, notes });
 
       return updated;
     });

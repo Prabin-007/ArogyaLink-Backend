@@ -20,6 +20,7 @@
 
 const prisma = require('../config/db');
 const { successResponse, errorResponse } = require('../utils/responseHelper');
+const { logEncounterCreated } = require('../utils/timeline');
 
 // =============================================================================
 // CREATE ENCOUNTER
@@ -108,14 +109,8 @@ const createEncounter = async (req, res, next) => {
       });
 
       // 2. Log the encounter as a timeline event for the patient
-      await tx.timelineEvent.create({
-        data: {
-          patientId:   patientId,
-          eventType:   'ENCOUNTER_CREATED',
-          referenceId: encounter.id, // Link back to this specific encounter
-          description: `A ${encounterType.replace(/_/g, ' ')} encounter was recorded.`,
-        },
-      });
+      // (shared helper — same event the mobile sync path writes)
+      await logEncounterCreated(tx, encounter);
 
       return encounter;
     });

@@ -25,6 +25,7 @@
 
 const prisma = require('../config/db');
 const { successResponse, errorResponse } = require('../utils/responseHelper');
+const { buildVitalsSummary, logVitalsRecorded } = require('../utils/timeline');
 
 // =============================================================================
 // RECORD VITALS
@@ -133,23 +134,18 @@ const recordVitals = async (req, res, next) => {
       });
 
       // 2. Build a human-readable summary for the timeline description
-      const measurementSummary = [
-        temperature            && `Temp: ${temperature}°C`,
-        heartRate              && `HR: ${heartRate} bpm`,
-        bloodPressureSystolic  && bloodPressureDiastolic && `BP: ${bloodPressureSystolic}/${bloodPressureDiastolic} mmHg`,
-        oxygenSaturation       && `SpO2: ${oxygenSaturation}%`,
-        weight                 && `Weight: ${weight} kg`,
-      ].filter(Boolean).join(', ');
-
-      // 3. Append a timeline event for the patient
-      await tx.timelineEvent.create({
-        data: {
-          patientId,
-          eventType:   'VITALS_RECORDED',
-          referenceId: vitals.id, // Link to the specific vitals record
-          description: `Vitals recorded${measurementSummary ? ': ' + measurementSummary : ''}.`,
-        },
+      // (raw request values are passed so the text matches what clients always saw)
+      const measurementSummary = buildVitalsSummary({
+        temperature,
+        heartRate,
+        bpSystolic:  bloodPressureSystolic,
+        bpDiastolic: bloodPressureDiastolic,
+        oxygenSaturation,
+        weight,
       });
+
+      // 3. Append a timeline event for the patient (shared helper)
+      await logVitalsRecorded(tx, vitals, measurementSummary);
 
       return vitals;
     });

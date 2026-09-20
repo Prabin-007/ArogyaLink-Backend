@@ -20,6 +20,35 @@
 
 const prisma = require('../config/db');
 const { successResponse, errorResponse } = require('../utils/responseHelper');
+const { logPatientRegistered, logHighRiskFlagged } = require('../utils/timeline');
+
+// ─── ASHA-work fields (added for mobile sync v2, all optional) ────────────────
+const VALID_CATEGORIES = ['GENERAL', 'PREGNANT', 'CHILD_UNDER_5', 'NCD', 'ELDERLY'];
+
+/**
+ * Validates the optional ASHA-work fields (category, lmpDate, isHighRisk,
+ * riskReasons). Returns an error message string, or null if they are fine.
+ * Only fields that are present are checked, so existing callers that never
+ * send them are unaffected.
+ */
+const validateAshaFields = ({ category, lmpDate, isHighRisk, riskReasons }) => {
+  if (category !== undefined && !VALID_CATEGORIES.includes(category)) {
+    return `Invalid category. Must be one of: ${VALID_CATEGORIES.join(', ')}`;
+  }
+  if (lmpDate !== undefined && lmpDate !== null && isNaN(new Date(lmpDate).getTime())) {
+    return 'Invalid lmpDate. Use an ISO 8601 date string.';
+  }
+  if (isHighRisk !== undefined && typeof isHighRisk !== 'boolean') {
+    return 'isHighRisk must be a boolean.';
+  }
+  if (
+    riskReasons !== undefined &&
+    !(Array.isArray(riskReasons) && riskReasons.every((r) => typeof r === 'string'))
+  ) {
+    return 'riskReasons must be an array of strings.';
+  }
+  return null;
+};
 
 // =============================================================================
 // CREATE PATIENT
@@ -35,7 +64,7 @@ const { successResponse, errorResponse } = require('../utils/responseHelper');
  *   name, dateOfBirth, gender, village, district, state, assignedAshaId
  *
  * Optional body fields:
- *   phone, address
+ *   phone, address, category, lmpDate, isHighRisk, riskReasons
  *
  * @param {import('express').Request}  req
  * @param {import('express').Response} res
@@ -53,6 +82,10 @@ const createPatient = async (req, res, next) => {
       district,
       state,
       assignedAshaId,
+      category,
+      lmpDate,
+      isHighRisk,
+      riskReasons,
     } = req.body;
 
     // ── Validation ────────────────────────────────────────────────────────────
@@ -84,6 +117,11 @@ const createPatient = async (req, res, next) => {
       );
     }
 
+    const ashaFieldError = validateAshaFields({ category, lmpDate, isHighRisk, riskReasons });
+    if (ashaFieldError) {
+      return errorResponse(res, ashaFieldError, 400);
+    }
+
     // ── Create Patient (inside a Prisma transaction) ──────────────────────────
     // We use $transaction to ensure that if the TimelineEvent creation fails,
     // the patient creation is also rolled back. Atomicity = data integrity.
@@ -102,18 +140,21 @@ const createPatient = async (req, res, next) => {
           // Only include assignedAshaId if it was actually provided.
           // Passing `undefined` to a Prisma relation field causes a validation error.
           ...(assignedAshaId ? { assignedAshaId } : {}),
+          // ASHA-work fields (optional; DB defaults apply when omitted)
+          ...(category   !== undefined ? { category } : {}),
+          ...(lmpDate    ? { lmpDate: new Date(lmpDate) } : {}),
+          ...(isHighRisk !== undefined ? { isHighRisk } : {}),
+          riskReasons: riskReasons || [],
         },
       });
 
-      // 2. Log the registration as a timeline event
-      await tx.timelineEvent.create({
-        data: {
-          patientId:   patient.id,
-          eventType:   'PATIENT_REGISTERED',
-          referenceId: patient.id, // The patient record IS the reference
-          description: `Patient "${patient.name}" was registered in the ArogyaLink system.`,
-        },
-      });
+      // 2. Log the registration as a timeline event (shared helper)
+      await logPatientRegistered(tx, patient);
+
+      // 3. Registered straight into high-risk → also flag it for doctors
+      if (patient.isHighRisk) {
+        await logHighRiskFlagged(tx, patient);
+      }
 
       return patient;
     });
@@ -180,7 +221,8 @@ const getPatient = async (req, res, next) => {
  * semantics via Prisma's update()).
  *
  * Allowed fields: name, dateOfBirth, gender, phone, address,
- *                 village, district, state, assignedAshaId
+ *                 village, district, state, assignedAshaId,
+ *                 category, lmpDate, isHighRisk, riskReasons
  *
  * @param {import('express').Request}  req - req.params.id = patient ID
  * @param {import('express').Response} res
@@ -199,6 +241,10 @@ const updatePatient = async (req, res, next) => {
       district,
       state,
       assignedAshaId,
+      category,
+      lmpDate,
+      isHighRisk,
+      riskReasons,
     } = req.body;
 
     // Make sure the patient exists before attempting an update
@@ -219,6 +265,11 @@ const updatePatient = async (req, res, next) => {
       }
     }
 
+    const ashaFieldError = validateAshaFields({ category, lmpDate, isHighRisk, riskReasons });
+    if (ashaFieldError) {
+      return errorResponse(res, ashaFieldError, 400);
+    }
+
     // Build the update payload — only include fields that were actually sent.
     // This prevents accidentally overwriting fields with undefined/null.
     const updateData = {};
@@ -231,10 +282,25 @@ const updatePatient = async (req, res, next) => {
     if (district       !== undefined) updateData.district       = district;
     if (state          !== undefined) updateData.state          = state;
     if (assignedAshaId !== undefined) updateData.assignedAshaId = assignedAshaId;
+    if (category       !== undefined) updateData.category       = category;
+    if (lmpDate        !== undefined) updateData.lmpDate        = lmpDate === null ? null : new Date(lmpDate);
+    if (isHighRisk     !== undefined) updateData.isHighRisk     = isHighRisk;
+    if (riskReasons    !== undefined) updateData.riskReasons    = riskReasons;
 
-    const updatedPatient = await prisma.patient.update({
-      where: { id },
-      data:  updateData,
+    // Update + (if the patient just became high-risk) the timeline event, atomically.
+    const updatedPatient = await prisma.$transaction(async (tx) => {
+      const updated = await tx.patient.update({
+        where: { id },
+        data:  updateData,
+      });
+
+      // Only the false → true transition raises the flag; re-saving an
+      // already-high-risk patient must not spam the timeline.
+      if (!existing.isHighRisk && updated.isHighRisk) {
+        await logHighRiskFlagged(tx, updated);
+      }
+
+      return updated;
     });
 
     return successResponse(res, { patient: updatedPatient }, 'Patient updated successfully');
