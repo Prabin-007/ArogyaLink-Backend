@@ -34,9 +34,11 @@ const {
 /**
  * POST /api/sync/upload
  * Upload a batch of offline-created records to the central server.
- * Body: { deviceId, records: { patients, encounters, vitals, prescriptions, followups } }
+ * Body: { deviceId, records: { patients, encounters, vitals, followups } }
+ * (referrals and prescriptions are doctor-created and download-only)
  *
- * Returns a detailed sync result with per-record success/failure info.
+ * Returns data.results[] — one { type, id, status: ok|conflict|error, updatedAt?, message? }
+ * per record — and data.serverTimestamp.
  */
 router.post(
   '/upload',
@@ -47,8 +49,8 @@ router.post(
 
 /**
  * GET /api/sync/download
- * Download records updated after a given timestamp for the worker's patients.
- * Query params: ?deviceId=X&lastSyncedAt=2026-09-01T00:00:00Z
+ * Download everything that changed after a given timestamp for the worker's patients.
+ * Query params: ?deviceId=X&lastSyncedAt=2026-09-01T00:00:00Z  (omit or "0" for a full sync)
  */
 router.get(
   '/download',

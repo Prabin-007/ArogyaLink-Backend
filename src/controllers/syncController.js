@@ -1,329 +1,649 @@
 /**
  * src/controllers/syncController.js
  * ------------------------------------
- * Handles data synchronization between the ASHA worker's offline SQLite
- * database and the central PostgreSQL server.
+ * Data synchronization between the ASHA worker's offline Android app (Room /
+ * SQLite) and the central PostgreSQL server.
  *
  * Why sync?
  * ASHA workers operate in villages with poor internet. They create records
- * offline (patients, encounters, vitals, etc.) and sync when connectivity
- * returns. This controller handles both directions:
- *   - Upload  → ASHA sends locally created / updated records to the server.
- *   - Download → ASHA fetches server updates for their assigned patients.
+ * offline (patients, home visits, vitals, follow-ups) and sync when
+ * connectivity returns.
+ *   - Upload   → phone sends locally created / edited records.
+ *   - Download → phone fetches what changed on the server (doctor actions,
+ *                referral status changes, new follow-ups...).
  *
- * Key Design Decisions:
- *   - Per-record error tolerance: if one record fails, others still sync.
- *   - Deduplication via `syncId` on patients (UUID set by the mobile app).
- *   - `server_id` in uploaded records means "I already have a server ID, update me".
- *   - If no `server_id`, treat as a new record to create.
+ * ── Key design decisions (v2) ────────────────────────────────────────────────
  *
- * ⚠️  IMPORTANT: Verify that these Prisma model names match your schema exactly:
- *   prisma.patient       → model Patient
- *   prisma.encounter     → model Encounter
- *   prisma.vitals        → model Vitals
- *   prisma.prescription  → model Prescription
- *   prisma.followUp      → model FollowUp
+ * 1. CLIENT-GENERATED UUIDs ARE THE REAL IDs.
+ *    The phone generates a UUID v4 for each new record and that UUID becomes
+ *    the primary key on the server. There is no local-id ↔ server-id mapping
+ *    table, so records created offline in the same batch can reference each
+ *    other (a vitals row can point at the encounter created 5 minutes earlier)
+ *    before the server has ever seen either. Records created on the web keep
+ *    their cuid ids — an id is just a string.
+ *
+ * 2. IDEMPOTENT. Re-sending the same batch (network dropped before the phone
+ *    saw the response) never creates duplicates and never duplicates timeline
+ *    events: a record that already exists is never re-created, and timeline
+ *    events are only written when the row is actually created / changed.
+ *
+ * 3. PER-RECORD RESULTS. Each record is processed in its own database
+ *    transaction (row + its timeline events commit or roll back together).
+ *    One bad record never blocks the others, and the response says exactly
+ *    which records the phone may mark as synced.
+ *
+ * 4. OPTIMISTIC CONCURRENCY instead of comparing clocks.
+ *    Phone clocks drift, so we never compare a phone timestamp with a server
+ *    timestamp. Instead, every record the server hands out carries its
+ *    `updatedAt`. To edit an EXISTING record the phone sends that value back as
+ *    `baseUpdatedAt` ("this is the version I edited"). The server updates only
+ *    if the row is still at that version:
+ *
+ *        UPDATE ... WHERE id = ? AND updatedAt = baseUpdatedAt
+ *
+ *    0 rows changed → someone else (a doctor on the web, another phone) changed
+ *    it in the meantime → status "conflict", nothing overwritten. The phone
+ *    re-downloads the record and re-applies the user's change. The check and
+ *    the write are one atomic statement, so there is no race window.
+ *    Every "ok" result returns the record's new `updatedAt` so the phone can
+ *    store it as its next baseUpdatedAt. Creates don't need one.
+ *
+ * 5. THE SERVER OWNS THE CLINICAL WORKFLOW. Referrals are created and moved
+ *    through their lifecycle only by doctors/specialists/hospital admins on the
+ *    web, so they are NOT uploadable from the phone — download only.
+ *    Prescriptions are doctor-created too: download only.
+ *
+ * 6. AUTHORIZATION. An ASHA/ANM may only touch patients assigned to her, and
+ *    only follow-ups assigned to her. Ownership is always checked through the
+ *    patient, and a record's patientId can never be changed by an update.
+ *    SYSTEM_ADMIN bypasses ownership (this is also what the AUTH_ENABLED=false
+ *    dev user is).
+ *
+ * 7. SAME TIMELINE AS THE WEB. Timeline events come from src/utils/timeline.js,
+ *    the same helper the regular endpoints use, so synced records show up in
+ *    GET /api/patients/:id/timeline exactly like web-created ones. Events are
+ *    stamped with the record's own (offline) time, not the sync time.
+ *
+ *   prisma.patient / encounter / vitals / followUp / prescription / referral /
+ *   facility → the matching models in prisma/schema.prisma
  */
+
+const { Prisma } = require('@prisma/client');
 
 const prisma = require('../config/db');
 const { successResponse, errorResponse } = require('../utils/responseHelper');
+const {
+  isUuid,
+  patientSchema,
+  encounterSchema,
+  vitalsSchema,
+  followupSchema,
+  uploadEnvelopeSchema,
+  formatZodError,
+} = require('../utils/syncValidation');
+const {
+  logPatientRegistered,
+  logHighRiskFlagged,
+  logEncounterCreated,
+  buildVitalsSummary,
+  logVitalsRecorded,
+  logFollowUpScheduled,
+  logFollowUpStatusChange,
+} = require('../utils/timeline');
+
+// =============================================================================
+// Small helpers
+// =============================================================================
+
+/**
+ * An EXPECTED, user-facing failure for one record (bad input, not your patient,
+ * missing parent...). Its message goes straight back to the phone in the
+ * per-record result. Anything else that is thrown is treated as an internal
+ * error and its details are logged, not returned.
+ */
+class RecordError extends Error {}
+
+/** Same message for "doesn't exist" and "isn't yours" so ids can't be probed. */
+const NOT_YOURS = (what, id) => `${what} "${id}" was not found or is not assigned to you.`;
+
+/** Normalises a value so Dates, arrays and null/undefined compare by content. */
+const normalise = (v) => {
+  if (v instanceof Date) return v.getTime();
+  if (Array.isArray(v)) return JSON.stringify(v);
+  return v === undefined ? null : v;
+};
+
+/**
+ * True if every field the phone sent already has that exact value on the
+ * server row. This is what makes retries safe: re-sending a record the server
+ * already holds is "unchanged" (→ ok), not a conflict and not a duplicate.
+ */
+const sameContent = (row, incoming) =>
+  Object.entries(incoming).every(([k, v]) => v === undefined || normalise(row[k]) === normalise(v));
+
+/** Throws if any of the listed fields are missing from a record being CREATED. */
+const requireForCreate = (rec, fields) => {
+  const missing = fields.filter((f) => rec[f] === undefined || rec[f] === null);
+  if (missing.length) {
+    throw new RecordError(`Missing required fields for a new record: ${missing.join(', ')}`);
+  }
+};
+
+/** New records must carry a client-generated UUID (cuids are server-minted). */
+const requireUuidForCreate = (id) => {
+  if (!isUuid(id)) {
+    throw new RecordError(
+      `Record "${id}" does not exist on the server, so it must be created with a UUID id. ` +
+        'Server-generated ids can only be used to update records the server already has.'
+    );
+  }
+};
+
+/**
+ * Loads a patient and enforces "this ASHA/ANM may only touch her own patients".
+ * Runs inside the record's transaction, so the check and the write see the same data.
+ */
+const getAccessiblePatient = async (tx, ctx, patientId) => {
+  const patient = await tx.patient.findUnique({ where: { id: patientId } });
+  if (!patient || (!ctx.isAdmin && patient.assignedAshaId !== ctx.user.id)) {
+    throw new RecordError(NOT_YOURS('Patient', patientId));
+  }
+  return patient;
+};
+
+/**
+ * Optimistic-concurrency update (see design note 4 at the top of the file).
+ *
+ * @param {string} model       Prisma model delegate name, e.g. 'patient'
+ * @param {object} existing    The row as currently stored
+ * @param {Date|undefined} baseUpdatedAt  The version the phone edited
+ * @param {object} comparable  Fields the phone is asking to set (compared + written)
+ * @param {object} derived     Extra server-computed fields written but NOT compared
+ *                             (e.g. completedAt = now), so retries stay idempotent
+ * @returns {{kind: 'unchanged'|'updated'|'conflict', row: object, message?: string}}
+ */
+const applyOptimisticUpdate = async (tx, model, existing, baseUpdatedAt, comparable, derived = {}) => {
+  // Nothing to change → the phone's copy already matches the server's.
+  if (sameContent(existing, comparable)) {
+    return { kind: 'unchanged', row: existing };
+  }
+
+  // The record exists but the phone can't say which version it edited.
+  if (!baseUpdatedAt) {
+    return {
+      kind: 'conflict',
+      row: existing,
+      message:
+        'This record already exists on the server with different content. Re-download it and ' +
+        'resend your change with baseUpdatedAt set to the server updatedAt you last received.',
+    };
+  }
+
+  // Atomic compare-and-set: only writes if nobody changed the row since baseUpdatedAt.
+  const { count } = await tx[model].updateMany({
+    where: { id: existing.id, updatedAt: baseUpdatedAt },
+    data: { ...comparable, ...derived },
+  });
+
+  const row = await tx[model].findUnique({ where: { id: existing.id } });
+  if (count === 0) {
+    return {
+      kind: 'conflict',
+      row,
+      message:
+        'The server copy changed after the version you edited (baseUpdatedAt no longer matches). ' +
+        'Nothing was overwritten. Re-download this record and re-apply your change.',
+    };
+  }
+  return { kind: 'updated', row };
+};
+
+/** Maps the outcome of a handler to the per-record result body. */
+const toOutcome = ({ kind, row, message }) =>
+  kind === 'conflict'
+    ? { status: 'conflict', updatedAt: row.updatedAt.toISOString(), message }
+    : { status: 'ok', updatedAt: row.updatedAt.toISOString() };
+
+// =============================================================================
+// Record handlers — one per record type.
+// Each runs INSIDE the record's own $transaction and returns an outcome object.
+// A thrown RecordError becomes { status: 'error' } for that record only.
+// =============================================================================
+
+// ── PATIENT ──────────────────────────────────────────────────────────────────
+const handlePatient = async (tx, rec, ctx) => {
+  const existing = await tx.patient.findUnique({ where: { id: rec.id } });
+
+  // ── Update an existing patient ─────────────────────────────────────────────
+  if (existing) {
+    if (!ctx.isAdmin && existing.assignedAshaId !== ctx.user.id) {
+      throw new RecordError(NOT_YOURS('Patient', rec.id));
+    }
+    // Reassigning a patient is a coordinator decision, not something a phone can do.
+    if (
+      !ctx.isAdmin &&
+      rec.assignedAshaId !== undefined &&
+      rec.assignedAshaId !== existing.assignedAshaId
+    ) {
+      throw new RecordError('assignedAshaId cannot be changed from the mobile app.');
+    }
+
+    const result = await applyOptimisticUpdate(tx, 'patient', existing, rec.baseUpdatedAt, {
+      name: rec.name,
+      dateOfBirth: rec.dateOfBirth,
+      gender: rec.gender,
+      phone: rec.phone,
+      address: rec.address,
+      village: rec.village,
+      district: rec.district,
+      state: rec.state,
+      category: rec.category,
+      lmpDate: rec.lmpDate,
+      isHighRisk: rec.isHighRisk,
+      riskReasons: rec.riskReasons,
+    });
+
+    // Doctors are told about a patient only on the false → true transition.
+    if (result.kind === 'updated' && !existing.isHighRisk && result.row.isHighRisk) {
+      await logHighRiskFlagged(tx, result.row);
+    }
+    return toOutcome(result);
+  }
+
+  // ── Create a new patient ───────────────────────────────────────────────────
+  requireUuidForCreate(rec.id);
+  requireForCreate(rec, ['name', 'dateOfBirth', 'gender', 'village', 'district', 'state']);
+
+  // Default the owner to the syncing ASHA; refuse to create patients for someone else.
+  const assignedAshaId = rec.assignedAshaId ?? ctx.user.id;
+  if (!ctx.isAdmin && assignedAshaId !== ctx.user.id) {
+    throw new RecordError('You can only create patients assigned to yourself.');
+  }
+
+  const patient = await tx.patient.create({
+    data: {
+      id: rec.id,
+      syncId: rec.id, // legacy column kept for backward compat; sync no longer depends on it
+      name: rec.name,
+      dateOfBirth: rec.dateOfBirth,
+      gender: rec.gender,
+      phone: rec.phone ?? null,
+      address: rec.address ?? null,
+      village: rec.village,
+      district: rec.district,
+      state: rec.state,
+      assignedAshaId,
+      category: rec.category, // undefined → DB default GENERAL
+      lmpDate: rec.lmpDate ?? null,
+      isHighRisk: rec.isHighRisk ?? false,
+      riskReasons: rec.riskReasons ?? [],
+      createdAt: rec.createdAt, // undefined → now()
+    },
+  });
+
+  await logPatientRegistered(tx, patient, rec.createdAt);
+  if (patient.isHighRisk) {
+    await logHighRiskFlagged(tx, patient, rec.createdAt);
+  }
+  return toOutcome({ kind: 'created', row: patient });
+};
+
+// ── ENCOUNTER ────────────────────────────────────────────────────────────────
+const handleEncounter = async (tx, rec, ctx) => {
+  const existing = await tx.encounter.findUnique({ where: { id: rec.id } });
+
+  // ── Update an existing encounter ───────────────────────────────────────────
+  if (existing) {
+    await getAccessiblePatient(tx, ctx, existing.patientId);
+    if (rec.patientId !== undefined && rec.patientId !== existing.patientId) {
+      throw new RecordError('patientId cannot be changed on an existing encounter.');
+    }
+
+    const result = await applyOptimisticUpdate(tx, 'encounter', existing, rec.baseUpdatedAt, {
+      facilityId: rec.facilityId,
+      encounterType: rec.encounterType,
+      symptoms: rec.symptoms,
+      clinicalNotes: rec.clinicalNotes,
+      encounterDate: rec.encounterDate,
+    });
+    return toOutcome(result);
+  }
+
+  // ── Create a new encounter ─────────────────────────────────────────────────
+  requireUuidForCreate(rec.id);
+  requireForCreate(rec, ['patientId', 'encounterType']); // doctorId / facilityId are optional
+  await getAccessiblePatient(tx, ctx, rec.patientId);
+
+  const encounter = await tx.encounter.create({
+    data: {
+      id: rec.id,
+      patientId: rec.patientId,
+      doctorId: rec.doctorId ?? null,
+      facilityId: rec.facilityId ?? null,
+      encounterType: rec.encounterType,
+      symptoms: rec.symptoms ?? [],
+      clinicalNotes: rec.clinicalNotes ?? null,
+      encounterDate: rec.encounterDate ?? new Date(), // honour the phone's visit time
+    },
+  });
+
+  await logEncounterCreated(tx, encounter, encounter.encounterDate);
+  return toOutcome({ kind: 'created', row: encounter });
+};
+
+// ── VITALS ───────────────────────────────────────────────────────────────────
+const MEASUREMENT_FIELDS = ['temperature', 'heartRate', 'bpSystolic', 'bpDiastolic', 'oxygenSaturation', 'weight'];
+
+const handleVitals = async (tx, rec, ctx) => {
+  const existing = await tx.vitals.findUnique({ where: { id: rec.id } });
+
+  // ── Update existing vitals ─────────────────────────────────────────────────
+  if (existing) {
+    await getAccessiblePatient(tx, ctx, existing.patientId);
+    if (rec.patientId !== undefined && rec.patientId !== existing.patientId) {
+      throw new RecordError('patientId cannot be changed on existing vitals.');
+    }
+
+    const result = await applyOptimisticUpdate(tx, 'vitals', existing, rec.baseUpdatedAt, {
+      temperature: rec.temperature,
+      heartRate: rec.heartRate,
+      bpSystolic: rec.bpSystolic,
+      bpDiastolic: rec.bpDiastolic,
+      oxygenSaturation: rec.oxygenSaturation,
+      weight: rec.weight,
+      recordedAt: rec.recordedAt,
+    });
+    return toOutcome(result);
+  }
+
+  // ── Create new vitals ──────────────────────────────────────────────────────
+  requireUuidForCreate(rec.id);
+  requireForCreate(rec, ['patientId']);
+  if (!MEASUREMENT_FIELDS.some((f) => rec[f] !== undefined && rec[f] !== null)) {
+    throw new RecordError(`At least one measurement is required (${MEASUREMENT_FIELDS.join(', ')}).`);
+  }
+  await getAccessiblePatient(tx, ctx, rec.patientId);
+
+  // Same integrity rule as the web endpoint: the encounter must exist and belong to this patient.
+  if (rec.encounterId) {
+    const encounter = await tx.encounter.findUnique({ where: { id: rec.encounterId } });
+    if (!encounter || encounter.patientId !== rec.patientId) {
+      throw new RecordError(`Encounter "${rec.encounterId}" does not exist for this patient.`);
+    }
+  }
+
+  const vitals = await tx.vitals.create({
+    data: {
+      id: rec.id,
+      patientId: rec.patientId,
+      encounterId: rec.encounterId ?? null,
+      temperature: rec.temperature ?? null,
+      heartRate: rec.heartRate ?? null,
+      bpSystolic: rec.bpSystolic ?? null,
+      bpDiastolic: rec.bpDiastolic ?? null,
+      oxygenSaturation: rec.oxygenSaturation ?? null,
+      weight: rec.weight ?? null,
+      recordedById: ctx.user.id, // always the authenticated user — never trusted from the payload
+      recordedAt: rec.recordedAt, // undefined → now(); the phone's time when it sent one
+    },
+  });
+
+  await logVitalsRecorded(tx, vitals, buildVitalsSummary(vitals), vitals.recordedAt);
+  return toOutcome({ kind: 'created', row: vitals });
+};
+
+// ── FOLLOW-UP ────────────────────────────────────────────────────────────────
+const handleFollowup = async (tx, rec, ctx) => {
+  const existing = await tx.followUp.findUnique({ where: { id: rec.id } });
+
+  // ── Update an existing follow-up ───────────────────────────────────────────
+  // An ASHA may update status / outcome / notes on follow-ups ASSIGNED TO HER
+  // (typically ones a doctor created on the web). Nothing else is editable.
+  if (existing) {
+    if (!ctx.isAdmin && existing.assignedToId !== ctx.user.id) {
+      throw new RecordError(NOT_YOURS('Follow-up', rec.id));
+    }
+    if (rec.patientId !== undefined && rec.patientId !== existing.patientId) {
+      throw new RecordError('patientId cannot be changed on an existing follow-up.');
+    }
+
+    // Marking COMPLETED without a completion time → the server records "now".
+    // Kept out of the comparison so a retry of the same update stays idempotent.
+    const derived = {};
+    if (rec.status === 'COMPLETED' && existing.status !== 'COMPLETED' && rec.completedAt === undefined) {
+      derived.completedAt = new Date();
+    }
+
+    const result = await applyOptimisticUpdate(
+      tx,
+      'followUp',
+      existing,
+      rec.baseUpdatedAt,
+      {
+        status: rec.status,
+        outcome: rec.outcome,
+        notes: rec.notes,
+        completedAt: rec.completedAt,
+      },
+      derived
+    );
+
+    // Status moved to COMPLETED / MISSED / ESCALATED → same timeline event as the web PATCH.
+    if (result.kind === 'updated' && result.row.status !== existing.status) {
+      await logFollowUpStatusChange(
+        tx,
+        result.row,
+        result.row.status,
+        { outcome: result.row.outcome, notes: result.row.notes },
+        result.row.status === 'COMPLETED' ? result.row.completedAt : undefined
+      );
+    }
+    return toOutcome(result);
+  }
+
+  // ── Create a new follow-up ─────────────────────────────────────────────────
+  requireUuidForCreate(rec.id);
+  requireForCreate(rec, ['patientId', 'dueDate']);
+  await getAccessiblePatient(tx, ctx, rec.patientId);
+
+  const assignedToId = rec.assignedToId ?? ctx.user.id;
+  if (!ctx.isAdmin && assignedToId !== ctx.user.id) {
+    throw new RecordError('You can only create follow-ups assigned to yourself.');
+  }
+
+  // Linked records must exist and belong to the same patient.
+  if (rec.relatedEncounterId) {
+    const enc = await tx.encounter.findUnique({ where: { id: rec.relatedEncounterId } });
+    if (!enc || enc.patientId !== rec.patientId) {
+      throw new RecordError(`Encounter "${rec.relatedEncounterId}" does not exist for this patient.`);
+    }
+  }
+  if (rec.relatedReferralId) {
+    const ref = await tx.referral.findUnique({ where: { id: rec.relatedReferralId } });
+    if (!ref || ref.patientId !== rec.patientId) {
+      throw new RecordError(`Referral "${rec.relatedReferralId}" does not exist for this patient.`);
+    }
+  }
+
+  // NOTE: unlike POST /api/followups we do NOT require dueDate to be in the
+  // future — a follow-up scheduled offline may already be overdue by sync time.
+  const status = rec.status ?? 'PENDING';
+  const followUp = await tx.followUp.create({
+    data: {
+      id: rec.id,
+      patientId: rec.patientId,
+      relatedEncounterId: rec.relatedEncounterId ?? null,
+      relatedReferralId: rec.relatedReferralId ?? null,
+      assignedToId,
+      dueDate: rec.dueDate,
+      status,
+      outcome: rec.outcome ?? null,
+      notes: rec.notes ?? null,
+      completedAt: rec.completedAt ?? (status === 'COMPLETED' ? new Date() : null),
+      createdAt: rec.createdAt,
+    },
+  });
+
+  await logFollowUpScheduled(tx, followUp, followUp.dueDate, followUp.assignedToId, rec.createdAt);
+  // Already resolved offline (e.g. visited and completed before ever syncing)? Record that too.
+  await logFollowUpStatusChange(
+    tx,
+    followUp,
+    followUp.status,
+    { outcome: followUp.outcome, notes: followUp.notes },
+    followUp.completedAt ?? undefined
+  );
+  return toOutcome({ kind: 'created', row: followUp });
+};
+
+// =============================================================================
+// Upload plumbing
+// =============================================================================
+
+/**
+ * Processing order matters: parents must exist before children reference them.
+ * patients → encounters → vitals → followups (referrals/prescriptions are not uploadable).
+ */
+const UPLOAD_PIPELINE = [
+  { key: 'patients', type: 'patient', schema: patientSchema, handler: handlePatient },
+  { key: 'encounters', type: 'encounter', schema: encounterSchema, handler: handleEncounter },
+  { key: 'vitals', type: 'vitals', schema: vitalsSchema, handler: handleVitals },
+  { key: 'followups', type: 'followup', schema: followupSchema, handler: handleFollowup },
+];
+
+/** Record types the phone must not upload, with the reason returned per record. */
+const REJECTED_UPLOAD_TYPES = [
+  {
+    key: 'referrals',
+    type: 'referral',
+    message:
+      'Referrals cannot be uploaded from the mobile app. They are created and managed by ' +
+      'doctors on the web portal and arrive on the phone through GET /api/sync/download.',
+  },
+  {
+    key: 'prescriptions',
+    type: 'prescription',
+    message:
+      'Prescriptions cannot be uploaded from the mobile app. They are issued by doctors and ' +
+      'arrive on the phone through GET /api/sync/download.',
+  },
+];
+
+/** Turns an unexpected exception into a safe, useful per-record message. */
+const describeError = (err) => {
+  if (err instanceof RecordError) return err.message;
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === 'P2003') {
+      return 'A referenced record does not exist (check patientId, encounterId, doctorId or assigned user).';
+    }
+    if (err.code === 'P2002') {
+      return 'A record with this id or unique key already exists.';
+    }
+  }
+  // Don't leak database internals to the client — log them for us instead.
+  console.error('[Sync] Unexpected error while saving a record:', err);
+  return 'Internal error while saving this record.';
+};
+
+/**
+ * Runs one record end-to-end: validate → transaction (write + timeline) → result.
+ * Never throws — every failure becomes a { status: 'error' } result.
+ */
+const processRecord = async ({ type, schema, handler }, raw, ctx) => {
+  const rawId = raw && typeof raw === 'object' ? raw.id : undefined;
+
+  const parsed = schema.safeParse(raw);
+  if (!parsed.success) {
+    return { type, id: rawId ?? null, status: 'error', message: formatZodError(parsed.error) };
+  }
+  const rec = parsed.data;
+
+  // Two uploads racing on the same brand-new id: the loser gets a unique-violation.
+  // Retrying once lets it see the winner's row and finish as an idempotent no-op.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const outcome = await prisma.$transaction((tx) => handler(tx, rec, ctx), { timeout: 15000 });
+      return { type, id: rec.id, ...outcome };
+    } catch (err) {
+      const isUniqueRace =
+        err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002' && attempt === 1;
+      if (isUniqueRace) continue;
+      return { type, id: rec.id, status: 'error', message: describeError(err) };
+    }
+  }
+};
 
 // =============================================================================
 // uploadOfflineData
 // =============================================================================
 /**
  * POST /api/sync/upload
- * Accepts a batch of offline records from a device and upserts them into the
- * central PostgreSQL database. Processes each record type independently so a
- * failure in one record does not block the rest.
  *
  * @requires Body: {
- *   deviceId: string,                    — Identifies which device is syncing
+ *   deviceId: string,
  *   records: {
- *     patients:      Array<PatientRecord>,
- *     encounters:    Array<EncounterRecord>,
- *     vitals:        Array<VitalsRecord>,
- *     prescriptions: Array<PrescriptionRecord>,
- *     followups:     Array<FollowUpRecord>
+ *     patients?:   PatientRecord[],
+ *     encounters?: EncounterRecord[],
+ *     vitals?:     VitalsRecord[],
+ *     followups?:  FollowUpRecord[]
  *   }
  * }
+ * @returns data: {
+ *   results: [{ type, id, status: 'ok'|'conflict'|'error', updatedAt?, message? }],
+ *   serverTimestamp: ISO string
+ * }
+ *   ok       → saved (or already identical on the server). Store `updatedAt` as the
+ *              record's baseUpdatedAt and mark it synced.
+ *   conflict → NOT saved; the server copy changed. `updatedAt` is the server's current
+ *              version. Re-download, re-apply the user's edit, resend.
+ *   error    → NOT saved; `message` says why (validation, ownership, missing parent...).
+ *
  * @requires Auth: ASHA or ANM
  */
 const uploadOfflineData = async (req, res, next) => {
   try {
-    const { deviceId, records } = req.body;
+    // Captured first so it reflects when this upload began.
+    const serverTimestamp = new Date().toISOString();
 
-    // ── Validate request body ─────────────────────────────────────────────────
-    if (!deviceId) {
-      return errorResponse(res, 'deviceId is required.', 400);
+    // ── Validate the envelope only (individual records are validated one by one) ──
+    const envelope = uploadEnvelopeSchema.safeParse(req.body);
+    if (!envelope.success) {
+      return errorResponse(res, formatZodError(envelope.error), 400);
     }
-    if (!records || typeof records !== 'object') {
-      return errorResponse(res, 'records object is required.', 400);
-    }
+    const { deviceId, records } = envelope.data;
 
-    // Destructure with safe defaults so we never crash if a type is missing
-    const {
-      patients = [],
-      encounters = [],
-      vitals = [],
-      prescriptions = [],
-      followups = [],
-    } = records;
+    const ctx = { user: req.user, isAdmin: req.user.role === 'SYSTEM_ADMIN' };
+    const results = [];
 
-    // ── Tracking counters and error collector ─────────────────────────────────
-    const synced = {
-      patients: 0,
-      encounters: 0,
-      vitals: 0,
-      prescriptions: 0,
-      followups: 0,
-    };
-    const errors = []; // Collects per-record errors without halting the batch
-
-    // ── Helper: add a structured error to the errors list ─────────────────────
-    const recordError = (type, index, identifier, message) => {
-      errors.push({ type, index, identifier, message });
-    };
-
-    // =========================================================================
-    // Process PATIENTS
-    // =========================================================================
-    for (let i = 0; i < patients.length; i++) {
-      const record = patients[i];
-      try {
-        if (!record.name || !record.assignedAshaId) {
-          recordError('patient', i, record.syncId || record.server_id, 'Missing required fields: name, assignedAshaId');
-          continue;
-        }
-
-        if (record.server_id) {
-          // Record already exists on the server — update it
-          await prisma.patient.update({
-            where: { id: record.server_id },
-            data: {
-              name: record.name,
-              phone: record.phone,
-              address: record.address,
-              village: record.village,
-              district: record.district,
-              state: record.state,
-              // Note: dateOfBirth and gender are typically not changed after registration
-            },
-          });
-        } else {
-          // Check for duplicate via syncId (the UUID the mobile app generates)
-          // syncId prevents creating the same patient twice if the upload is retried.
-          if (record.syncId) {
-            const existing = await prisma.patient.findUnique({
-              where: { syncId: record.syncId },
-            });
-            if (existing) {
-              // Already synced — skip silently (not an error, just a duplicate upload)
-              synced.patients++;
-              continue;
-            }
-          }
-
-          // Create a brand-new patient record
-          await prisma.patient.create({
-            data: {
-              name: record.name,
-              dateOfBirth: new Date(record.dateOfBirth),
-              gender: record.gender,
-              phone: record.phone || null,
-              address: record.address || null,
-              village: record.village,
-              district: record.district,
-              state: record.state,
-              assignedAshaId: record.assignedAshaId,
-              syncId: record.syncId || null,
-            },
-          });
-        }
-        synced.patients++;
-      } catch (err) {
-        // One patient failing should NOT block others from being processed
-        recordError('patient', i, record.syncId || record.server_id, err.message);
+    // ── Process in dependency order, one transaction per record ───────────────
+    for (const step of UPLOAD_PIPELINE) {
+      for (const raw of records[step.key] || []) {
+        results.push(await processRecord(step, raw, ctx));
       }
     }
 
-    // =========================================================================
-    // Process ENCOUNTERS
-    // =========================================================================
-    for (let i = 0; i < encounters.length; i++) {
-      const record = encounters[i];
-      try {
-        if (!record.patientId || !record.doctorId || !record.encounterType) {
-          recordError('encounter', i, record.server_id, 'Missing required fields: patientId, doctorId, encounterType');
-          continue;
-        }
-
-        if (record.server_id) {
-          // Update existing encounter — only safe fields (notes, symptoms)
-          await prisma.encounter.update({
-            where: { id: record.server_id },
-            data: {
-              clinicalNotes: record.clinicalNotes,
-              symptoms: record.symptoms || [],
-            },
-          });
-        } else {
-          await prisma.encounter.create({
-            data: {
-              patientId: record.patientId,
-              doctorId: record.doctorId,
-              facilityId: record.facilityId,
-              encounterType: record.encounterType,
-              symptoms: record.symptoms || [],
-              clinicalNotes: record.clinicalNotes || null,
-              encounterDate: new Date(record.encounterDate || Date.now()),
-            },
-          });
-        }
-        synced.encounters++;
-      } catch (err) {
-        recordError('encounter', i, record.server_id, err.message);
+    // ── Tell the phone loudly about record types it is not allowed to send ────
+    for (const rejected of REJECTED_UPLOAD_TYPES) {
+      for (const raw of records[rejected.key] || []) {
+        results.push({
+          type: rejected.type,
+          id: raw && typeof raw === 'object' && raw.id ? raw.id : null,
+          status: 'error',
+          message: rejected.message,
+        });
       }
     }
 
-    // =========================================================================
-    // Process VITALS
-    // =========================================================================
-    for (let i = 0; i < vitals.length; i++) {
-      const record = vitals[i];
-      try {
-        if (!record.patientId || !record.recordedById) {
-          recordError('vitals', i, record.server_id, 'Missing required fields: patientId, recordedById');
-          continue;
-        }
-
-        if (record.server_id) {
-          await prisma.vitals.update({
-            where: { id: record.server_id },
-            data: {
-              temperature: record.temperature,
-              heartRate: record.heartRate,
-              bpSystolic: record.bpSystolic,
-              bpDiastolic: record.bpDiastolic,
-              oxygenSaturation: record.oxygenSaturation,
-              weight: record.weight,
-            },
-          });
-        } else {
-          await prisma.vitals.create({
-            data: {
-              patientId: record.patientId,
-              encounterId: record.encounterId || null,
-              temperature: record.temperature || null,
-              heartRate: record.heartRate || null,
-              bpSystolic: record.bpSystolic || null,
-              bpDiastolic: record.bpDiastolic || null,
-              oxygenSaturation: record.oxygenSaturation || null,
-              weight: record.weight || null,
-              recordedById: record.recordedById,
-            },
-          });
-        }
-        synced.vitals++;
-      } catch (err) {
-        recordError('vitals', i, record.server_id, err.message);
-      }
-    }
-
-    // =========================================================================
-    // Process PRESCRIPTIONS
-    // =========================================================================
-    for (let i = 0; i < prescriptions.length; i++) {
-      const record = prescriptions[i];
-      try {
-        if (!record.patientId || !record.encounterId || !record.doctorId || !record.medicineDetails) {
-          recordError('prescription', i, record.server_id, 'Missing required fields: patientId, encounterId, doctorId, medicineDetails');
-          continue;
-        }
-
-        if (record.server_id) {
-          await prisma.prescription.update({
-            where: { id: record.server_id },
-            data: {
-              medicineDetails: record.medicineDetails,
-              instructions: record.instructions,
-            },
-          });
-        } else {
-          await prisma.prescription.create({
-            data: {
-              patientId: record.patientId,
-              encounterId: record.encounterId,
-              doctorId: record.doctorId,
-              medicineDetails: record.medicineDetails,
-              instructions: record.instructions || null,
-            },
-          });
-        }
-        synced.prescriptions++;
-      } catch (err) {
-        recordError('prescription', i, record.server_id, err.message);
-      }
-    }
-
-    // =========================================================================
-    // Process FOLLOW-UPS
-    // =========================================================================
-    for (let i = 0; i < followups.length; i++) {
-      const record = followups[i];
-      try {
-        if (!record.patientId || !record.assignedToId || !record.dueDate) {
-          recordError('followup', i, record.server_id, 'Missing required fields: patientId, assignedToId, dueDate');
-          continue;
-        }
-
-        if (record.server_id) {
-          // ASHA is updating the outcome of a follow-up recorded offline
-          await prisma.followUp.update({
-            where: { id: record.server_id },
-            data: {
-              status: record.status,
-              outcome: record.outcome,
-              notes: record.notes,
-              completedAt: record.status === 'COMPLETED' ? new Date() : undefined,
-            },
-          });
-        } else {
-          await prisma.followUp.create({
-            data: {
-              patientId: record.patientId,
-              relatedEncounterId: record.relatedEncounterId || null,
-              relatedReferralId: record.relatedReferralId || null,
-              assignedToId: record.assignedToId,
-              dueDate: new Date(record.dueDate),
-              status: record.status || 'PENDING',
-              notes: record.notes || null,
-            },
-          });
-        }
-        synced.followups++;
-      } catch (err) {
-        recordError('followup', i, record.server_id, err.message);
-      }
-    }
-
-    // ── Build and return the sync result ──────────────────────────────────────
+    const failed = results.filter((r) => r.status !== 'ok').length;
     return successResponse(
       res,
-      {
-        success: true,
-        deviceId,
-        synced,
-        errorCount: errors.length,
-        errors, // Empty array if everything succeeded
-      },
-      errors.length === 0
+      { deviceId, results, serverTimestamp },
+      failed === 0
         ? 'All records synced successfully.'
-        : `Sync completed with ${errors.length} error(s). Check the errors array.`,
-      errors.length === 0 ? 200 : 207 // 207 Multi-Status: some succeeded, some failed
+        : `Sync processed ${results.length} record(s); ${failed} need attention. Check each result's status.`
     );
   } catch (error) {
-    // This catches a total failure (e.g., database is down)
+    // Total failure (e.g. database is down) — the phone keeps everything pending and retries.
     next(error);
   }
 };
@@ -333,117 +653,82 @@ const uploadOfflineData = async (req, res, next) => {
 // =============================================================================
 /**
  * GET /api/sync/download?deviceId=X&lastSyncedAt=2026-09-01T00:00:00Z
- * Returns all records updated after `lastSyncedAt` for patients assigned to
- * the authenticated ASHA worker. This allows the mobile app to stay up-to-date
- * with changes made by doctors on the web portal.
  *
- * @requires Query: deviceId, lastSyncedAt (ISO 8601 date string)
+ * Returns FULL objects (every column the app needs to fill its local database)
+ * for everything that changed since `lastSyncedAt`:
+ *   patients assigned to this ASHA, and those patients' encounters, vitals,
+ *   prescriptions and referrals (with their current status); follow-ups
+ *   assigned to this ASHA; and the facilities list.
+ *
+ * "Changed" means `updatedAt > lastSyncedAt` on every table.
+ * `lastSyncedAt` missing or "0" → everything (first sync after login).
+ *
+ * `serverTimestamp` is captured at the START of the request and the phone
+ * should store it as its next `lastSyncedAt`. If we took it at the end, a row
+ * written while the queries were running would be older than the timestamp yet
+ * absent from the response, and the next sync would silently skip it.
+ *
+ * Every record's `updatedAt` is what the phone sends back as `baseUpdatedAt`
+ * when it edits that record.
+ *
+ * @requires Query: deviceId; optional lastSyncedAt (ISO 8601, or "0")
  * @requires Auth: ASHA or ANM
  */
 const downloadUpdates = async (req, res, next) => {
   try {
-    const { deviceId, lastSyncedAt } = req.query;
+    // ⏱ Captured BEFORE any query runs (see note above).
+    const serverTimestamp = new Date();
 
-    // ── Validate query parameters ─────────────────────────────────────────────
+    const { deviceId, lastSyncedAt } = req.query;
     if (!deviceId) {
       return errorResponse(res, 'deviceId is required as a query parameter.', 400);
     }
-    if (!lastSyncedAt) {
+
+    // Missing / "0" → epoch → "everything".
+    const since =
+      !lastSyncedAt || lastSyncedAt === '0' ? new Date(0) : new Date(lastSyncedAt);
+    if (isNaN(since.getTime())) {
       return errorResponse(
         res,
-        'lastSyncedAt is required as a query parameter (ISO 8601 format, e.g. 2026-09-01T00:00:00Z).',
+        'Invalid lastSyncedAt. Use an ISO 8601 date (e.g. 2026-09-01T00:00:00Z) or "0" for a full sync.',
         400
       );
     }
 
-    const sinceDate = new Date(lastSyncedAt);
-    if (isNaN(sinceDate.getTime())) {
-      return errorResponse(res, 'Invalid lastSyncedAt date format. Use ISO 8601.', 400);
-    }
+    const changed = { updatedAt: { gt: since } };
+    // Only this ASHA's patients (relation filter — no giant id list needed).
+    const myPatient = { patient: { assignedAshaId: req.user.id } };
 
-    // ── Find all patients assigned to this ASHA worker ────────────────────────
-    // We only return data for the patients this ASHA is responsible for.
-    const assignedPatients = await prisma.patient.findMany({
-      where: {
-        assignedAshaId: req.user.id,
-        updatedAt: { gt: sinceDate }, // Only patients updated after last sync
-      },
-      select: { id: true, name: true, phone: true, village: true, updatedAt: true, syncId: true },
-    });
-
-    // Collect IDs for efficient related-record queries
-    const assignedPatientIds = await prisma.patient
-      .findMany({
-        where: { assignedAshaId: req.user.id },
-        select: { id: true },
-      })
-      .then((rows) => rows.map((r) => r.id));
-
-    if (assignedPatientIds.length === 0) {
-      // No patients assigned — return empty payload
-      return successResponse(
-        res,
-        { patients: [], encounters: [], vitals: [], prescriptions: [], followUps: [], referrals: [] },
-        'No assigned patients found.'
-      );
-    }
-
-    // ── Fetch all updated records for assigned patients in parallel ───────────
-    // Using Promise.all for efficiency — all queries run concurrently.
-    const [encounters, vitals, prescriptions, followUps, referrals] = await Promise.all([
-      prisma.encounter.findMany({
-        where: {
-          patientId: { in: assignedPatientIds },
-          createdAt: { gt: sinceDate },
-        },
-        orderBy: { createdAt: 'desc' },
-      }),
-
-      prisma.vitals.findMany({
-        where: {
-          patientId: { in: assignedPatientIds },
-          recordedAt: { gt: sinceDate },
-        },
-        orderBy: { recordedAt: 'desc' },
-      }),
-
-      prisma.prescription.findMany({
-        where: {
-          patientId: { in: assignedPatientIds },
-          createdAt: { gt: sinceDate },
-        },
-        orderBy: { createdAt: 'desc' },
-      }),
-
-      // Include follow-ups assigned directly to this ASHA worker
-      prisma.followUp.findMany({
-        where: {
-          assignedToId: req.user.id,
-          updatedAt: { gt: sinceDate },
-        },
-        orderBy: { dueDate: 'asc' },
-      }),
-
-      prisma.referral.findMany({
-        where: {
-          patientId: { in: assignedPatientIds },
-          updatedAt: { gt: sinceDate },
-        },
-        orderBy: { updatedAt: 'desc' },
-      }),
-    ]);
+    const [patients, encounters, vitals, prescriptions, referrals, followups, facilities] =
+      await Promise.all([
+        prisma.patient.findMany({
+          where: { assignedAshaId: req.user.id, ...changed },
+          orderBy: { updatedAt: 'asc' },
+        }),
+        prisma.encounter.findMany({ where: { ...myPatient, ...changed }, orderBy: { updatedAt: 'asc' } }),
+        prisma.vitals.findMany({ where: { ...myPatient, ...changed }, orderBy: { updatedAt: 'asc' } }),
+        prisma.prescription.findMany({ where: { ...myPatient, ...changed }, orderBy: { updatedAt: 'asc' } }),
+        // Referral status is set by doctors/hospitals — the ASHA only ever reads it.
+        prisma.referral.findMany({ where: { ...myPatient, ...changed }, orderBy: { updatedAt: 'asc' } }),
+        prisma.followUp.findMany({
+          where: { assignedToId: req.user.id, ...changed },
+          orderBy: { updatedAt: 'asc' },
+        }),
+        prisma.facility.findMany({ where: changed, orderBy: { name: 'asc' } }),
+      ]);
 
     return successResponse(
       res,
       {
-        serverTimestamp: new Date().toISOString(), // ASHA saves this as the new lastSyncedAt
+        serverTimestamp: serverTimestamp.toISOString(), // phone stores this as its next lastSyncedAt
         deviceId,
-        patients: assignedPatients,
+        patients,
         encounters,
         vitals,
         prescriptions,
-        followUps,
         referrals,
+        followups,
+        facilities,
       },
       'Updates downloaded successfully.'
     );
