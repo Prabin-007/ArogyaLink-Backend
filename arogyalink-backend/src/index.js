@@ -16,12 +16,15 @@
 // This makes process.env.DATABASE_URL, process.env.PORT, etc. available.
 require('dotenv').config();
 
+const http    = require('http');
 const express = require('express');
-const cors = require('cors');
-const morgan = require('morgan');
+const cors    = require('cors');
+const morgan  = require('morgan');
+const { Server } = require('socket.io');
 
 // Internal imports
 const errorHandler = require('./middleware/errorHandler');
+const { registerTeleconsultationSocket } = require('./socket/teleconsultationSocket');
 
 // ─── App Initialization ────────────────────────────────────────────────────────
 const app = express();
@@ -103,6 +106,20 @@ app.use('/api/followups',     require('./routes/followups'));
 // ── Offline Data Synchronization ───────────────────────────────────────────────
 app.use('/api/sync',          require('./routes/sync'));
 
+// ── Teleconsultation (WebRTC + Socket.io + Bhashini speech translation) ────────
+// POST   /api/teleconsultations              — create request
+// GET    /api/teleconsultations/incoming     — doctor's live queue
+// GET    /api/teleconsultations/mine         — requester's list
+// GET    /api/teleconsultations/:id          — single request
+// PATCH  /api/teleconsultations/:id/accept   — accept + create Encounter + roomId
+// PATCH  /api/teleconsultations/:id/reject   — decline
+// PATCH  /api/teleconsultations/:id/cancel   — cancel (requester)
+// PATCH  /api/teleconsultations/:id/complete — mark done (doctor)
+app.use('/api/teleconsultations',  require('./routes/teleconsultationRoutes'));
+
+// GET /api/teleconsult-doctors               — doctor/specialist directory for UI dropdowns
+app.use('/api/teleconsult-doctors', require('./routes/teleconsultDoctorsRoutes'));
+
 // ─── 404 Handler ──────────────────────────────────────────────────────────────
 /**
  * Catches any request to a route that doesn't exist.
@@ -124,12 +141,36 @@ app.use((req, res) => {
  */
 app.use(errorHandler);
 
+// ─── HTTP Server + Socket.io ──────────────────────────────────────────────────
+/**
+ * Wrapping the Express app in an HTTP server lets Socket.io share the same port.
+ * WebRTC media never travels through here — Socket.io only handles signaling
+ * (offer/answer/ICE) and small Bhashini translation-chunk payloads.
+ */
+const httpServer = http.createServer(app);
+
+const io = new Server(httpServer, {
+  cors: {
+    origin: process.env.CLIENT_ORIGIN || '*',
+    methods: ['GET', 'POST'],
+  },
+});
+
+// Make io available to REST controllers via req.app.get("io").
+// This allows acceptRequest, rejectRequest, etc. to push Socket.io events
+// without importing io directly (which would create a circular dependency).
+app.set('io', io);
+
+// Register all teleconsultation socket handlers.
+registerTeleconsultationSocket(io);
+
 // ─── Start Server ─────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+httpServer.listen(PORT, () => {
   console.log('');
   console.log('🚀 ArogyaLink Backend Server is running!');
   console.log(`📡 URL:         http://localhost:${PORT}`);
   console.log(`❤️  Health:      http://localhost:${PORT}/health`);
+  console.log(`🔌 Socket.io:   ws://localhost:${PORT}  (teleconsultation signaling)`);
   console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`🔐 Auth:        ${process.env.AUTH_ENABLED === 'true' ? 'ENABLED' : 'DISABLED (dev mode)'}`);
   console.log('');

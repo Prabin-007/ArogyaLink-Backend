@@ -112,6 +112,16 @@ enum TimelineEventType {
   EMERGENCY_ESCALATED         // Emergency escalation triggered (Person 5 integration)
 }
 
+// The lifecycle of a teleconsultation request, mirroring ReferralStatus shape
+// so it introduces no unfamiliar pattern in the codebase.
+enum TeleconsultationStatus {
+  CREATED    // Request raised by ASHA / ANM / PHC Doctor
+  ACCEPTED   // Doctor/Specialist accepted; roomId generated; Encounter created
+  REJECTED   // Doctor/Specialist declined
+  CANCELLED  // Requester cancelled before acceptance
+  COMPLETED  // Call ended and marked done
+}
+
 // =============================================================================
 // MODELS
 // =============================================================================
@@ -140,6 +150,9 @@ model User {
   referralsCreated Referral[]    @relation("ReferralCreatedBy")
   referralEvents   ReferralEvent[] @relation("ReferralEventUpdatedBy")
   followUpsAssigned FollowUp[]   @relation("FollowUpAssignedTo")
+  // Teleconsultation back-relations
+  teleconsultAsDoctor    TeleconsultationRequest[] @relation("TeleconsultDoctor")
+  teleconsultAsRequester TeleconsultationRequest[] @relation("TeleconsultRequester")
 
   @@map("users") // Maps to snake_case table name in PostgreSQL
 }
@@ -174,6 +187,7 @@ model Patient {
   timeline       TimelineEvent[]
   vitals         Vitals[]
   prescriptions  Prescription[]
+  teleconsultations TeleconsultationRequest[] // Teleconsultations involving this patient
 
   @@index([assignedAshaId]) // Fast lookup: "show me all patients for this ASHA worker"
   @@map("patients")
@@ -373,4 +387,54 @@ model TimelineEvent {
 
   @@index([patientId]) // "Get full timeline for this patient" – sorted by createdAt
   @@map("timeline_events")
+}
+
+// =============================================================================
+// TeleconsultationRequest – remote consultation lifecycle
+// =============================================================================
+// Mirrors the Referral lifecycle shape (CREATED → ACCEPTED / REJECTED) so the
+// pattern is immediately familiar to any team member who has read referralController.js.
+//
+// Flow:
+//   ASHA/ANM/PHC Doctor → POST /api/teleconsultations
+//   → Doctor/Specialist notified via Socket.io
+//   → PATCH /api/teleconsultations/:id/accept
+//       → creates Encounter (encounterType: TELECONSULTATION)
+//       → generates roomId, notifies requester over Socket.io
+//   → Both sides join the WebRTC room via Socket.io signaling
+model TeleconsultationRequest {
+  id          String                 @id @default(cuid())
+
+  // The patient this teleconsultation is for (registered patient record)
+  patientId   String
+  patient     Patient                @relation(fields: [patientId], references: [id])
+
+  // The doctor or specialist being called
+  doctorId    String
+  doctor      User                   @relation("TeleconsultDoctor", fields: [doctorId], references: [id])
+
+  // The staff member who created the request (ASHA / ANM / PHC Doctor)
+  requesterId String
+  requester   User                   @relation("TeleconsultRequester", fields: [requesterId], references: [id])
+
+  // Clinical reason for the teleconsultation
+  reason      String
+
+  // Lifecycle status — same shape as ReferralStatus for team consistency
+  status      TeleconsultationStatus @default(CREATED)
+
+  // Set on ACCEPTED — both sides join this room for WebRTC signaling
+  roomId      String?
+
+  // Created by acceptRequest; links back to the clinical Encounter record
+  encounterId String?                @unique
+
+  createdAt   DateTime               @default(now())
+  updatedAt   DateTime               @updatedAt
+
+  @@index([patientId])   // "Show all teleconsultations for this patient"
+  @@index([doctorId])    // "Show all incoming teleconsultations for this doctor"
+  @@index([requesterId]) // "Show requests made by this ASHA/ANM"
+  @@index([status])      // "Show all pending/accepted teleconsultations"
+  @@map("teleconsultation_requests")
 }
