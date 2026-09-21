@@ -48,7 +48,7 @@ router.use(authenticate);
 // patients (filter by ?assignedAshaId=).
 router.get(
   '/',
-  authorize('SYSTEM_ADMIN', 'DOCTOR', 'SPECIALIST', 'HOSPITAL_ADMIN'),
+  authorize('SYSTEM_ADMIN', 'DOCTOR', 'SPECIALIST', 'HOSPITAL_ADMIN', 'ASHA', 'ANM'),
   listPatients
 );
 
