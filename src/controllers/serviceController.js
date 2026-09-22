@@ -144,46 +144,51 @@ const updateServiceAvailability = async (req, res, next) => {
         404
       );
     }
+    const existingAvailability = await prisma.serviceAvailability.findUnique({
+  where: {
+    serviceId_facilityId: {
+      serviceId,
+      facilityId,
+    },
+  },
+  select: {
+    available: true,
+  },
+});
 
-    const existingAvailability = await prisma.facilityService.findUnique({
-      where: {
-        facilityId_serviceName: {
-          facilityId,
-          serviceName: service.name,
-        },
-      },
+const serviceAvailability = await prisma.serviceAvailability.upsert({
+  where: {
+    serviceId_facilityId: {
+      serviceId,
+      facilityId,
+    },
+  },
+  create: {
+    serviceId,
+    facilityId,
+    available,
+  },
+  update: {
+    available,
+  },
+  include: {
+    service: {
       select: {
-        available: true,
+        id: true,
+        name: true,
       },
-    });
-
-    const serviceAvailability = await prisma.facilityService.upsert({
-      where: {
-        facilityId_serviceName: {
-          facilityId,
-          serviceName: service.name,
-        },
+    },
+    facility: {
+      select: {
+        id: true,
+        name: true,
+        type: true,
+        district: true,
+        state: true,
       },
-      create: {
-        facilityId,
-        serviceName: service.name,
-        available,
-      },
-      update: {
-        available,
-      },
-      include: {
-        facility: {
-          select: {
-            id: true,
-            name: true,
-            type: true,
-            district: true,
-            state: true,
-          },
-        },
-      },
-    });
+    },
+  },
+});
 
     if (existingAvailability?.available && !serviceAvailability.available) {
       await createNotification({
@@ -234,11 +239,11 @@ const getServiceAvailability = async (req, res, next) => {
       );
     }
 
-    const availability = await prisma.facilityService.findMany({
-      where: {
-        serviceName: service.name,
-        available: true,
-      },
+    const availability = await prisma.serviceAvailability.findMany({
+     where: {
+  serviceId: id,
+  available: true,
+},
       select: {
         available: true,
         lastUpdated: true,

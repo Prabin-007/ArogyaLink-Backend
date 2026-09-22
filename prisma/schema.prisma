@@ -527,7 +527,6 @@ model FacilityService {
   facilityId  String
   serviceName String
   available   Boolean  @default(true)
-  lastUpdated DateTime @default(now())
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 

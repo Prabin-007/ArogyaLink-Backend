@@ -150,7 +150,7 @@ async function main() {
     }
 
     for (const facilityId of facilityIds) {
-      const existingAvailability = await prisma.facilityService.findUnique({
+      const existingAvailability = await prisma.serviceAvailability.findUnique({
         where: {
           serviceId_facilityId: {
             serviceId: service.id,
@@ -160,7 +160,7 @@ async function main() {
       });
 
       if (!existingAvailability) {
-        await prisma.facilityService.create({
+        await prisma.serviceAvailability.create({
           data: {
             serviceId: service.id,
             facilityId,

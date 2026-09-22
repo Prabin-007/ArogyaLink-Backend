@@ -11,7 +11,7 @@ CREATE TABLE "services" (
 );
 
 -- CreateTable
-CREATE TABLE "facility_services" (
+CREATE TABLE "service_availability" (
     "id" TEXT NOT NULL,
     "serviceId" TEXT NOT NULL,
     "facilityId" TEXT NOT NULL,
@@ -26,16 +26,16 @@ CREATE TABLE "facility_services" (
 CREATE INDEX "services_name_idx" ON "services"("name");
 
 -- CreateIndex
-CREATE INDEX "facility_services_facilityId_idx" ON "facility_services"("facilityId");
+CREATE INDEX "facility_services_facilityId_idx" ON "service_availability"("facilityId");
 
 -- CreateIndex
-CREATE INDEX "facility_services_serviceId_idx" ON "facility_services"("serviceId");
+CREATE INDEX "facility_services_serviceId_idx" ON "service_availability"("serviceId");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "facility_services_serviceId_facilityId_key" ON "facility_services"("serviceId", "facilityId");
+CREATE UNIQUE INDEX "facility_services_serviceId_facilityId_key" ON "service_availability"("serviceId", "facilityId");
 
 -- AddForeignKey
-ALTER TABLE "facility_services" ADD CONSTRAINT "facility_services_serviceId_fkey" FOREIGN KEY ("serviceId") REFERENCES "services"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "service_availability" ADD CONSTRAINT "facility_services_serviceId_fkey" FOREIGN KEY ("serviceId") REFERENCES "services"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "facility_services" ADD CONSTRAINT "facility_services_facilityId_fkey" FOREIGN KEY ("facilityId") REFERENCES "facilities"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "service_availability" ADD CONSTRAINT "facility_services_facilityId_fkey" FOREIGN KEY ("facilityId") REFERENCES "facilities"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
