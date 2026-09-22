@@ -112,7 +112,7 @@ const updateServiceAvailability = async (req, res, next) => {
       return errorResponse(res, 'available must be a boolean', 400);
     }
 
-    const [service, facility, existingAvailability] = await Promise.all([
+    const [service, facility] = await Promise.all([
       prisma.service.findUnique({
         where: { id: serviceId },
         select: {
@@ -125,17 +125,6 @@ const updateServiceAvailability = async (req, res, next) => {
         select: {
           id: true,
           name: true,
-        },
-      }),
-      prisma.serviceAvailability.findUnique({
-        where: {
-          serviceId_facilityId: {
-            serviceId,
-            facilityId,
-          },
-        },
-        select: {
-          available: true,
         },
       }),
     ]);
@@ -156,28 +145,34 @@ const updateServiceAvailability = async (req, res, next) => {
       );
     }
 
-    const serviceAvailability = await prisma.serviceAvailability.upsert({
+    const existingAvailability = await prisma.facilityService.findUnique({
       where: {
-        serviceId_facilityId: {
-          serviceId,
+        facilityId_serviceName: {
           facilityId,
+          serviceName: service.name,
+        },
+      },
+      select: {
+        available: true,
+      },
+    });
+
+    const serviceAvailability = await prisma.facilityService.upsert({
+      where: {
+        facilityId_serviceName: {
+          facilityId,
+          serviceName: service.name,
         },
       },
       create: {
-        serviceId,
         facilityId,
+        serviceName: service.name,
         available,
       },
       update: {
         available,
       },
       include: {
-        service: {
-          select: {
-            id: true,
-            name: true,
-          },
-        },
         facility: {
           select: {
             id: true,
@@ -195,7 +190,11 @@ const updateServiceAvailability = async (req, res, next) => {
         type: 'GENERAL',
         priority: 'HIGH',
         title: 'Service Unavailable',
-        message: service.name + ' is no longer available at ' + facility.name + '.',
+        message:
+          service.name +
+          ' is no longer available at ' +
+          facility.name +
+          '.',
       });
     }
 
@@ -206,6 +205,7 @@ const updateServiceAvailability = async (req, res, next) => {
     );
   } catch (error) {
     next(error);
+
   }
 };
 
@@ -234,9 +234,9 @@ const getServiceAvailability = async (req, res, next) => {
       );
     }
 
-    const availability = await prisma.serviceAvailability.findMany({
+    const availability = await prisma.facilityService.findMany({
       where: {
-        serviceId: id,
+        serviceName: service.name,
         available: true,
       },
       select: {

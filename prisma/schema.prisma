@@ -522,10 +522,12 @@ model Facility {
 // Used in Phase 1 eligibility filtering: if a required service is unavailable,
 // the facility is excluded from consideration.
 model FacilityService {
+  
   id          String   @id @default(cuid())
-  facilityId  String                        // FK → facilities.id
-  serviceName String                        // e.g., "CARDIOLOGY", "OBSTETRICS", "PEDIATRICS"
-  available   Boolean  @default(true)       // Is this service currently available?
+  facilityId  String
+  serviceName String
+  available   Boolean  @default(true)
+  lastUpdated DateTime @default(now())
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
