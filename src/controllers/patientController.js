@@ -25,6 +25,18 @@ const { logPatientRegistered, logHighRiskFlagged } = require('../utils/timeline'
 // ─── ASHA-work fields (added for mobile sync v2, all optional) ────────────────
 const VALID_CATEGORIES = ['GENERAL', 'PREGNANT', 'CHILD_UNDER_5', 'NCD', 'ELDERLY'];
 
+const CATEGORY_ALIASES = {
+  PREGNANT_WOMAN: 'PREGNANT',
+  CHRONIC_DISEASE: 'NCD',
+  INFANT: 'CHILD_UNDER_5',
+};
+
+const normalizeCategory = (cat) => {
+  if (!cat || typeof cat !== 'string') return cat;
+  const upper = cat.trim().toUpperCase();
+  return CATEGORY_ALIASES[upper] || upper;
+};
+
 /**
  * Validates the optional ASHA-work fields (category, lmpDate, isHighRisk,
  * riskReasons). Returns an error message string, or null if they are fine.
@@ -32,8 +44,11 @@ const VALID_CATEGORIES = ['GENERAL', 'PREGNANT', 'CHILD_UNDER_5', 'NCD', 'ELDERL
  * send them are unaffected.
  */
 const validateAshaFields = ({ category, lmpDate, isHighRisk, riskReasons }) => {
-  if (category !== undefined && !VALID_CATEGORIES.includes(category)) {
-    return `Invalid category. Must be one of: ${VALID_CATEGORIES.join(', ')}`;
+  if (category !== undefined) {
+    const normalized = normalizeCategory(category);
+    if (!VALID_CATEGORIES.includes(normalized)) {
+      return `Invalid category. Must be one of: ${VALID_CATEGORIES.join(', ')}`;
+    }
   }
   if (lmpDate !== undefined && lmpDate !== null && isNaN(new Date(lmpDate).getTime())) {
     return 'Invalid lmpDate. Use an ISO 8601 date string.';
@@ -141,7 +156,7 @@ const createPatient = async (req, res, next) => {
           // Passing `undefined` to a Prisma relation field causes a validation error.
           ...(assignedAshaId ? { assignedAshaId } : {}),
           // ASHA-work fields (optional; DB defaults apply when omitted)
-          ...(category   !== undefined ? { category } : {}),
+          ...(category   !== undefined ? { category: normalizeCategory(category) } : {}),
           ...(lmpDate    ? { lmpDate: new Date(lmpDate) } : {}),
           ...(isHighRisk !== undefined ? { isHighRisk } : {}),
           riskReasons: riskReasons || [],
@@ -283,7 +298,7 @@ const updatePatient = async (req, res, next) => {
     if (district       !== undefined) updateData.district       = district;
     if (state          !== undefined) updateData.state          = state;
     if (assignedAshaId !== undefined) updateData.assignedAshaId = assignedAshaId;
-    if (category       !== undefined) updateData.category       = category;
+    if (category       !== undefined) updateData.category       = normalizeCategory(category);
     if (lmpDate        !== undefined) updateData.lmpDate        = lmpDate === null ? null : new Date(lmpDate);
     if (isHighRisk     !== undefined) updateData.isHighRisk     = isHighRisk;
     if (riskReasons    !== undefined) updateData.riskReasons    = riskReasons;
