@@ -12,9 +12,15 @@
     "db:studio": "prisma studio",
     "db:deploy": "prisma migrate deploy",
     "db:seed": "prisma db seed",
-    "test": "node test/sync.test.js"
+    "test": "node test/sync.test.js",
+    "test:smart-referral": "jest"
   },
-  "keywords": ["arogyalink", "health", "backend", "api"],
+  "keywords": [
+    "arogyalink",
+    "health",
+    "backend",
+    "api"
+  ],
   "author": "ArogyaLink Team",
   "license": "ISC",
   "dependencies": {
@@ -28,6 +34,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "jest": "^30.5.2",
     "nodemon": "^3.1.4",
     "prisma": "^5.14.0"
   },

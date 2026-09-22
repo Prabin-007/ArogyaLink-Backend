@@ -1,6 +1,7 @@
 // =============================================================================
 // ArogyaLink – Prisma Schema (PostgreSQL)
 // Person 3 Responsibility: Patient Records, Follow-Up & Referral Tracking
+// Person 4 Responsibility: Smart Referral AI – Facility Models
 // =============================================================================
 // This schema defines the central PostgreSQL database for ArogyaLink.
 // It connects ASHA workers, PHC doctors, hospitals, patients, referrals,
@@ -10,6 +11,7 @@
 //   ASHA registers patient
 //     → PHC doctor encounter
 //     → Vitals + Prescription recorded
+//     → Smart Referral AI selects best facility (Person 4)
 //     → Referral created
 //     → Hospital accepts → Patient arrives → Treatment → Follow-up
 //     → Timeline updated at every step
@@ -123,13 +125,24 @@ enum PatientCategory {
   ELDERLY         // Elderly care
 }
 
-// Level of the health system a facility belongs to.
+// Level of the health system a facility belongs to (Person 1 & Person 4).
 enum FacilityType {
   SUB_CENTRE
   PHC
   CHC
   DISTRICT_HOSPITAL
   MEDICAL_COLLEGE
+  TERTIARY
+  PRIVATE
+  AYUSHMAN
+}
+
+// Operational status of the facility (Person 4).
+enum FacilityOperationalStatus {
+  OPERATIONAL           // Fully operational
+  PARTIALLY_OPERATIONAL // Some services may be unavailable
+  CLOSED                // Closed (temporarily or permanently)
+  MAINTENANCE           // Under maintenance
 }
 
 // =============================================================================
@@ -319,6 +332,15 @@ model Referral {
   patientArrivedAt       DateTime?                            // When patient physically arrived
   treatmentCompletedAt   DateTime?                            // When treatment was marked done
   requiresFollowUp       Boolean         @default(false)      // Flag: does this referral need a follow-up?
+
+  // ── Person 4 Smart Referral fields ──────────────────────────────────────────
+  // These fields are populated by the Smart Referral AI when a referral is created
+  // via the smart referral endpoint. They are optional for backward compatibility
+  // with any direct POSTs to /api/referrals that don't use smart referral.
+  recommendationScore    Float?                               // Smart Referral score (0–100)
+  recommendationReasons  String[]                             // Explainable reasons for this facility pick
+  alternativeFacilities  Json?                                // JSON array of alternative facility recommendations
+
   createdAt              DateTime        @default(now())
   updatedAt              DateTime        @updatedAt
 
@@ -416,25 +438,106 @@ model TimelineEvent {
   @@map("timeline_events")
 }
 
-// -----------------------------------------------------------------------------
-// Facility – reference list of health facilities (sub-centres, PHCs, hospitals)
-// -----------------------------------------------------------------------------
-// Served to the mobile app so an ASHA can pick a facility offline.
-// NOTE: Referral.referringFacilityId / receivingFacilityId and
-// Encounter.facilityId stay plain strings on purpose (NOT foreign keys) so
-// existing web-portal code that sends free-form facility IDs keeps working.
+// =============================================================================
+// PERSON 1 & PERSON 4: FACILITY MODELS & SMART REFERRAL AI
+// =============================================================================
+// Represents PHCs, CHCs, district hospitals, and tertiary centers.
+// Used by the mobile app offline cache and the Smart Referral AI matching engine.
 model Facility {
-  id        String       @id @default(cuid())
-  name      String
-  type      FacilityType
-  district  String
-  state     String
-  latitude  Float?
-  longitude Float?
-  phone     String?
-  createdAt DateTime     @default(now())
-  updatedAt DateTime     @updatedAt
+  id                  String                    @id @default(cuid())
+  name                String                    // Full facility name (e.g., "District Hospital Shillong")
+  type                FacilityType              // SUB_CENTRE / PHC / CHC / DISTRICT_HOSPITAL / etc.
+  address             String?                   // Physical address (optional for backward compatibility)
+  district            String                    // District (for filtering by region)
+  state               String                    // State
+  latitude            Float?                    // GPS latitude (decimal degrees) for distance calculation
+  longitude           Float?                    // GPS longitude (decimal degrees) for distance calculation
+  operationalStatus   FacilityOperationalStatus @default(OPERATIONAL) // Is it open?
+  emergencyCapability Boolean                   @default(false)       // Can handle emergency cases?
+  waitingTimeMinutes  Int?                      // Estimated current waiting time in minutes
+  phone               String?                   // Contact number
+  lastUpdated         DateTime                  @default(now())       // When facility data was last refreshed
+  createdAt           DateTime                  @default(now())
+  updatedAt           DateTime                  @updatedAt
 
-  @@index([district]) // "List facilities in this district"
+  // Relations (Person 4 Smart Referral)
+  services            FacilityService[]         // Services offered by this facility
+  specialists         FacilitySpecialist[]      // Specialists available at this facility
+  resources           FacilityResource[]        // Diagnostics/resources available at this facility
+
+  @@index([district])
+  @@index([type])
+  @@index([district, state])
+  @@index([operationalStatus])
   @@map("facilities")
+}
+
+// -----------------------------------------------------------------------------
+// FacilityService – medical services offered by a facility
+// -----------------------------------------------------------------------------
+// A service could be "CARDIOLOGY", "NEUROLOGY", "GENERAL_MEDICINE", etc.
+// Used in Phase 1 eligibility filtering: if a required service is unavailable,
+// the facility is excluded from consideration.
+model FacilityService {
+  id          String   @id @default(cuid())
+  facilityId  String                        // FK → facilities.id
+  serviceName String                        // e.g., "CARDIOLOGY", "OBSTETRICS", "PEDIATRICS"
+  available   Boolean  @default(true)       // Is this service currently available?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  facility    Facility @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  @@unique([facilityId, serviceName]) // A facility can only list each service once
+  @@index([facilityId])
+  @@index([serviceName, available])   // "Find all facilities offering CARDIOLOGY"
+  @@map("facility_services")
+}
+
+// -----------------------------------------------------------------------------
+// FacilitySpecialist – specialist doctors available at a facility
+// -----------------------------------------------------------------------------
+// Used in Phase 1 eligibility filtering: if a required specialist is unavailable,
+// the facility is excluded (or penalized based on config).
+model FacilitySpecialist {
+  id                String   @id @default(cuid())
+  facilityId        String                        // FK → facilities.id
+  specialization    String                        // e.g., "CARDIOLOGIST", "NEUROLOGIST", "SURGEON"
+  available         Boolean  @default(true)       // Is this specialist currently on duty?
+  doctorCount       Int      @default(1)          // Total number of such specialists at this facility
+  maleDoctorCount   Int      @default(0)          // Number of male specialists
+  femaleDoctorCount Int      @default(0)          // Number of female specialists
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  facility       Facility @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  @@unique([facilityId, specialization]) // One row per specialty per facility
+  @@index([facilityId])
+  @@index([specialization, available])    // "Find all facilities with a cardiologist"
+  @@map("facility_specialists")
+}
+
+// -----------------------------------------------------------------------------
+// FacilityResource – diagnostics and medical resources at a facility
+// -----------------------------------------------------------------------------
+// Examples: "ECG", "MRI", "VENTILATOR", "BLOOD_BANK", "CT_SCAN"
+// Used in Phase 1 eligibility filtering and Phase 5 scoring.
+// Person 6 (Medicine Inventory) can later extend this model or inject
+// medicine availability data here or via a separate API.
+model FacilityResource {
+  id           String   @id @default(cuid())
+  facilityId   String                        // FK → facilities.id
+  resourceName String                        // e.g., "ECG", "MRI", "BLOOD_BANK"
+  available    Boolean  @default(true)       // Is this resource currently available?
+  quantity     Int?                          // Optional: number of units available (e.g., ventilators)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  facility     Facility @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  @@unique([facilityId, resourceName]) // One row per resource per facility
+  @@index([facilityId])
+  @@index([resourceName, available])    // "Find all facilities with an ECG"
+  @@map("facility_resources")
 }
