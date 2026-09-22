@@ -108,11 +108,17 @@ const createReferral = async (req, res, next) => {
       requiredDiagnostics = [],
     } = req.body;
 
+    const resolvedReferringFacilityId = referringFacilityId || req.user?.facilityId || 'Saswad PHC';
+
     // ── Validate always-required fields ───────────────────────────────────────
-    if (!patientId || !encounterId || !referringFacilityId || !reason || !priority) {
+    if (!patientId || !reason || !priority) {
+      const missing = [];
+      if (!patientId) missing.push('patientId');
+      if (!reason) missing.push('reason');
+      if (!priority) missing.push('priority');
       return errorResponse(
         res,
-        'Missing required fields: patientId, encounterId, referringFacilityId, reason, priority',
+        `Missing required fields: ${missing.join(', ')}`,
         400
       );
     }
@@ -193,8 +199,8 @@ const createReferral = async (req, res, next) => {
       const newReferral = await tx.referral.create({
         data: {
           patientId,
-          encounterId,
-          referringFacilityId,
+          encounterId:           encounterId || null,
+          referringFacilityId:   resolvedReferringFacilityId,
           receivingFacilityId:   resolvedReceivingFacilityId,
           createdById:           req.user.id, // Set from the authenticated user's JWT payload
           reason,
