@@ -463,15 +463,6 @@ const getFacilityReferrals = async (req, res, next) => {
   try {
     const { receivingFacilityId, patientId, status, priority } = req.query;
 
-    // Require at least one filter to prevent returning ALL referrals in the system
-    if (!receivingFacilityId && !patientId) {
-      return errorResponse(
-        res,
-        'Please provide either receivingFacilityId or patientId as a query parameter.',
-        400
-      );
-    }
-
     // ── Build the Prisma where clause dynamically ─────────────────────────────
     const where = {};
 
