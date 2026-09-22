@@ -127,7 +127,7 @@ const updateServiceAvailability = async (req, res, next) => {
           name: true,
         },
       }),
-      prisma.facilityService.findUnique({
+      prisma.serviceAvailability.findUnique({
         where: {
           serviceId_facilityId: {
             serviceId,
@@ -156,7 +156,7 @@ const updateServiceAvailability = async (req, res, next) => {
       );
     }
 
-    const serviceAvailability = await prisma.facilityService.upsert({
+    const serviceAvailability = await prisma.serviceAvailability.upsert({
       where: {
         serviceId_facilityId: {
           serviceId,
@@ -234,7 +234,7 @@ const getServiceAvailability = async (req, res, next) => {
       );
     }
 
-    const availability = await prisma.facilityService.findMany({
+    const availability = await prisma.serviceAvailability.findMany({
       where: {
         serviceId: id,
         available: true,
