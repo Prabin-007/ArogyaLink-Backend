@@ -79,7 +79,7 @@ const createEncounter = async (req, res, next) => {
     }
 
     // Validate encounterType against the schema enum
-    const validEncounterTypes = ['PHC_VISIT', 'TELECONSULTATION', 'EMERGENCY', 'FOLLOW_UP_VISIT'];
+    const validEncounterTypes = ['PHC_VISIT', 'TELECONSULTATION', 'EMERGENCY', 'FOLLOW_UP_VISIT', 'HOME_VISIT'];
     if (!validEncounterTypes.includes(encounterType)) {
       return errorResponse(
         res,

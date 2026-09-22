@@ -41,7 +41,7 @@ const {
 router.post(
   '/',
   authenticate,
-  authorize(ROLES.DOCTOR, ROLES.SPECIALIST),
+  authorize(ROLES.DOCTOR, ROLES.SPECIALIST, ROLES.SYSTEM_ADMIN),
   createReferral
 );
 
@@ -51,12 +51,11 @@ router.post(
  * Supports query params: ?receivingFacilityId=, ?patientId=, ?status=, ?priority=
  *
  * Hospital admins use this to see incoming referrals for their facility.
- * Doctors use this to track referrals they've created.
+ * Doctors and field workers use this to track patient referrals.
  */
 router.get(
   '/',
   authenticate,
-  authorize(ROLES.DOCTOR, ROLES.SPECIALIST, ROLES.HOSPITAL_ADMIN),
   getFacilityReferrals
 );
 
@@ -79,7 +78,7 @@ router.get(
 router.patch(
   '/:id/status',
   authenticate,
-  authorize(ROLES.DOCTOR, ROLES.SPECIALIST, ROLES.HOSPITAL_ADMIN),
+  authorize(ROLES.DOCTOR, ROLES.SPECIALIST, ROLES.HOSPITAL_ADMIN, ROLES.SYSTEM_ADMIN),
   updateReferralStatus
 );
 

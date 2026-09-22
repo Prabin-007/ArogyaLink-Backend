@@ -35,7 +35,7 @@ router.use(authenticate);
 // at the PHC. Specialists may also create teleconsultation encounters.
 router.post(
   '/',
-  authorize('ASHA', 'ANM', 'DOCTOR'),
+  authorize('ASHA', 'ANM', 'DOCTOR', 'SPECIALIST', 'SYSTEM_ADMIN'),
   createEncounter
 );
 

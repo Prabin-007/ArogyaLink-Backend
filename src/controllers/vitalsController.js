@@ -57,7 +57,7 @@ const { buildVitalsSummary, logVitalsRecorded } = require('../utils/timeline');
  */
 const recordVitals = async (req, res, next) => {
   try {
-    const {
+    let {
       patientId,
       encounterId,
       temperature,
@@ -67,6 +67,15 @@ const recordVitals = async (req, res, next) => {
       oxygenSaturation,
       weight,
     } = req.body;
+
+    // Support combined "120/80" string format for blood pressure
+    if (req.body.bloodPressure && typeof req.body.bloodPressure === 'string') {
+      const parts = req.body.bloodPressure.split('/');
+      if (parts.length === 2) {
+        if (bloodPressureSystolic === undefined) bloodPressureSystolic = parseInt(parts[0], 10);
+        if (bloodPressureDiastolic === undefined) bloodPressureDiastolic = parseInt(parts[1], 10);
+      }
+    }
 
     // ── Validation ────────────────────────────────────────────────────────────
     if (!patientId) {
