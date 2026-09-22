@@ -16,6 +16,11 @@
  *   prisma.referralEvent   → model ReferralEvent
  *   prisma.timelineEvent   → model TimelineEvent
  *   prisma.patient         → model Patient
+ *
+ * Person 4 Smart Referral AI integration:
+ *   This controller now supports an optional "smart mode" that automatically
+ *   selects the best receiving facility using the Smart Referral AI service.
+ *   All existing direct-referral clients remain fully backward-compatible.
  */
 
 const prisma = require('../config/db');
@@ -50,11 +55,37 @@ const STATUS_TO_TIMELINE_EVENT = {
 // =============================================================================
 /**
  * POST /api/referrals
- * Creates a new referral for a patient from a referring facility to a receiving
- * facility. Also creates the initial ReferralEvent (audit log) and a
- * TimelineEvent (patient journey record).
  *
- * @requires Body: { patientId, encounterId, referringFacilityId, receivingFacilityId, reason, priority }
+ * Creates a new referral for a patient. Supports TWO modes:
+ *
+ * MODE 1 – SMART REFERRAL (Person 4 integration):
+ *   Provide smart referral parameters (requiredService, patientLatitude, etc.)
+ *   The Smart Referral AI will:
+ *     a. Find eligible facilities
+ *     b. Score and rank them
+ *     c. Return the recommended facility as receivingFacilityId
+ *     d. Attach the recommendation + alternatives to the referral
+ *
+ *   Required for smart mode:
+ *     patientId, encounterId, referringFacilityId, reason, priority,
+ *     patientLatitude, patientLongitude
+ *   Optional for smart mode:
+ *     requiredService, requiredSpecialist, emergency, requiredDiagnostics
+ *
+ * MODE 2 – DIRECT REFERRAL (Person 3 original, fully backward-compatible):
+ *   Provide receivingFacilityId explicitly.
+ *   No AI recommendation is generated.
+ *   All existing clients continue to work without any changes.
+ *
+ *   Required:
+ *     patientId, encounterId, referringFacilityId, receivingFacilityId,
+ *     reason, priority
+ *
+ * Integration with Person 5 (Emergency Triage):
+ *   Send emergency: true  or  priority: "EMERGENCY"
+ *   The AI will switch to the emergency weight profile and only consider
+ *   emergency-capable facilities.
+ *
  * @requires Auth: DOCTOR or SPECIALIST
  */
 const createReferral = async (req, res, next) => {
@@ -63,23 +94,31 @@ const createReferral = async (req, res, next) => {
       patientId,
       encounterId,
       referringFacilityId,
-      receivingFacilityId,
       reason,
       priority,
+      // Direct referral (Mode 2 – backward compatibility)
+      receivingFacilityId,
+      // Smart referral params (Mode 1 – Person 4)
+      patientLatitude,
+      patientLongitude,
+      requiredService,
+      requiredSpecialist,
+      preferredSpecialistGender,
+      emergency = false,
+      requiredDiagnostics = [],
     } = req.body;
 
-    // ── Validate required fields ──────────────────────────────────────────────
-    if (
-      !patientId ||
-      !encounterId ||
-      !referringFacilityId ||
-      !receivingFacilityId ||
-      !reason ||
-      !priority
-    ) {
+    const resolvedReferringFacilityId = referringFacilityId || req.user?.facilityId || 'Saswad PHC';
+
+    // ── Validate always-required fields ───────────────────────────────────────
+    if (!patientId || !reason || !priority) {
+      const missing = [];
+      if (!patientId) missing.push('patientId');
+      if (!reason) missing.push('reason');
+      if (!priority) missing.push('priority');
       return errorResponse(
         res,
-        'Missing required fields: patientId, encounterId, referringFacilityId, receivingFacilityId, reason, priority',
+        `Missing required fields: ${missing.join(', ')}`,
         400
       );
     }
@@ -100,21 +139,83 @@ const createReferral = async (req, res, next) => {
       return errorResponse(res, `Patient with ID "${patientId}" not found.`, 404);
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Determine mode: Smart vs Direct
+    // ─────────────────────────────────────────────────────────────────────────
+    const isSmartMode =
+      patientLatitude != null && patientLongitude != null && !receivingFacilityId;
+
+    let resolvedReceivingFacilityId = receivingFacilityId || null;
+    let recommendationData = null;
+
+    if (isSmartMode) {
+      // ── MODE 1: Smart Referral AI ────────────────────────────────────────────
+      // Lazy-load to avoid circular dependency issues if any future refactoring occurs
+      const { getSmartReferralRecommendation } = require('../services/smartReferralService');
+
+      const result = await getSmartReferralRecommendation({
+        patientLatitude:   parseFloat(patientLatitude),
+        patientLongitude:  parseFloat(patientLongitude),
+        requiredService,
+        requiredSpecialist,
+        preferredSpecialistGender,
+        priority,
+        emergency: emergency === true || emergency === 'true',
+        requiredDiagnostics: Array.isArray(requiredDiagnostics) ? requiredDiagnostics : [],
+      });
+
+      if (result.noEligibleFacilities) {
+        // Cannot create a referral if no facility can serve the patient.
+        // Return 422 Unprocessable Entity with a clear explanation.
+        return errorResponse(
+          res,
+          result.message ||
+            'No eligible facilities found. Cannot create smart referral. ' +
+            'Please check facility data or specify a receivingFacilityId directly.',
+          422
+        );
+      }
+
+      // Use the top-ranked facility as the receiving facility
+      resolvedReceivingFacilityId = result.recommendation.facilityId;
+      recommendationData = result;
+
+    } else if (!receivingFacilityId) {
+      // Neither smart mode nor direct mode — require one or the other
+      return errorResponse(
+        res,
+        'Provide either (a) receivingFacilityId for a direct referral, or ' +
+        '(b) patientLatitude and patientLongitude for a smart referral.',
+        400
+      );
+    }
+
     // ── Create referral + initial audit event + timeline event in one transaction ──
     // Using $transaction ensures all three records are created atomically.
     // If any step fails, none of the records are saved (data integrity).
     const referral = await prisma.$transaction(async (tx) => {
       // Step 1: Create the referral record
+      // Smart Referral extra fields are stored on the referral for traceability.
       const newReferral = await tx.referral.create({
         data: {
           patientId,
-          encounterId,
-          referringFacilityId,
-          receivingFacilityId,
-          createdById: req.user.id, // Set from the authenticated user's JWT payload
+          encounterId:           encounterId || null,
+          referringFacilityId:   resolvedReferringFacilityId,
+          receivingFacilityId:   resolvedReceivingFacilityId,
+          createdById:           req.user.id, // Set from the authenticated user's JWT payload
           reason,
           priority,
           status: 'CREATED', // Default starting status
+          // Smart Referral AI fields (null for direct referrals – backward compatible)
+          recommendationScore:   recommendationData
+            ? recommendationData.recommendation.score
+            : null,
+          recommendationReasons: recommendationData
+            ? recommendationData.recommendation.reasons
+            : [],
+          alternativeFacilities: recommendationData
+            ? recommendationData.alternatives
+            : null,
         },
       });
 
@@ -122,11 +223,13 @@ const createReferral = async (req, res, next) => {
       // previousStatus is null because this is the very first event.
       await tx.referralEvent.create({
         data: {
-          referralId: newReferral.id,
+          referralId:     newReferral.id,
           previousStatus: null,
-          newStatus: 'CREATED',
-          updatedById: req.user.id,
-          remarks: 'Referral created.',
+          newStatus:      'CREATED',
+          updatedById:    req.user.id,
+          remarks: isSmartMode
+            ? `Smart referral created. AI recommended facility with score ${recommendationData.recommendation.score}.`
+            : 'Referral created.',
         },
       });
 
@@ -134,16 +237,48 @@ const createReferral = async (req, res, next) => {
       await tx.timelineEvent.create({
         data: {
           patientId,
-          eventType: 'REFERRAL_CREATED',
+          eventType:   'REFERRAL_CREATED',
           referenceId: newReferral.id, // Link back to the referral so the UI can navigate to it
-          description: `Referral created with priority ${priority}. Reason: ${reason}`,
+          description: isSmartMode
+            ? `Smart referral created with priority ${priority}. Reason: ${reason}. AI-recommended facility score: ${recommendationData.recommendation.score}.`
+            : `Referral created with priority ${priority}. Reason: ${reason}`,
         },
       });
 
       return newReferral;
     });
 
-    return successResponse(res, { referral }, 'Referral created successfully.', 201);
+    // ── Build response ────────────────────────────────────────────────────────
+    // Response is enriched with Smart Referral data when in smart mode.
+    // Direct referrals return the same shape as before (backward compatible).
+    const responseData = {
+      referral: {
+        id:                   referral.id,
+        patientId:            referral.patientId,
+        encounterId:          referral.encounterId,
+        referringFacilityId:  referral.referringFacilityId,
+        receivingFacilityId:  referral.receivingFacilityId,
+        reason:               referral.reason,
+        priority:             referral.priority,
+        status:               referral.status,
+        createdAt:            referral.createdAt,
+      },
+    };
+
+    if (recommendationData) {
+      responseData.recommendation = recommendationData.recommendation;
+      responseData.bestOverall    = recommendationData.bestOverall;
+      responseData.bestMatchingGender = recommendationData.bestMatchingGender;
+      responseData.alternatives   = recommendationData.alternatives;
+      responseData.smartReferral  = {
+        weightProfile:   recommendationData.weightProfile,
+        eligibleCount:   recommendationData.eligibleCount,
+        excludedCount:   recommendationData.excludedCount,
+        isEmergencyMode: recommendationData.weightProfile === 'EMERGENCY',
+      };
+    }
+
+    return successResponse(res, responseData, 'Referral created successfully.', 201);
   } catch (error) {
     // Pass unexpected errors to the global error handler (src/middleware/errorHandler.js)
     next(error);
@@ -333,15 +468,6 @@ const updateReferralStatus = async (req, res, next) => {
 const getFacilityReferrals = async (req, res, next) => {
   try {
     const { receivingFacilityId, patientId, status, priority } = req.query;
-
-    // Require at least one filter to prevent returning ALL referrals in the system
-    if (!receivingFacilityId && !patientId) {
-      return errorResponse(
-        res,
-        'Please provide either receivingFacilityId or patientId as a query parameter.',
-        400
-      );
-    }
 
     // ── Build the Prisma where clause dynamically ─────────────────────────────
     const where = {};

@@ -60,7 +60,7 @@ router.post(
 router.get(
   '/assigned',
   authenticate,
-  authorize(ROLES.ASHA, ROLES.ANM),
+  authorize(ROLES.ASHA, ROLES.ANM, ROLES.DOCTOR, ROLES.SPECIALIST, ROLES.SYSTEM_ADMIN),
   getAssignedFollowUps
 );
 

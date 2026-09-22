@@ -35,7 +35,7 @@ router.use(authenticate);
 // during a PHC encounter. Specialists can also record during teleconsultations.
 router.post(
   '/',
-  authorize('ASHA', 'ANM', 'DOCTOR'),
+  authorize('ASHA', 'ANM', 'DOCTOR', 'SPECIALIST', 'SYSTEM_ADMIN'),
   recordVitals
 );
 

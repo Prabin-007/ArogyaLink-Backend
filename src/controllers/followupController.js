@@ -271,10 +271,11 @@ const getAssignedFollowUps = async (req, res, next) => {
     const { status } = req.query;
 
     // ── Build where clause ────────────────────────────────────────────────────
-    // Always filter by the currently logged-in worker's ID
-    const where = {
-      assignedToId: req.user.id,
-    };
+    // If ASHA or ANM, filter by their own assigned user ID; supervisory roles see all
+    const where = {};
+    if (req.user?.role === 'ASHA' || req.user?.role === 'ANM') {
+      where.assignedToId = req.user.id;
+    }
 
     // Optionally further filter by status
     if (status) {
