@@ -752,10 +752,61 @@ npm test
 - Create high-priority referrals: `POST /api/referrals` with `priority: "EMERGENCY"`
 - Escalate follow-ups: `PATCH /api/followups/:id` with `status: "ESCALATED"`
 
-### Person 6 (Medicines / Notifications)
-- Read prescriptions: `GET /api/prescriptions/patient/:patientId`
-- Monitor follow-up status: `GET /api/followups/overdue`
+### Person 6 (Medicine / Diagnostic / Service Availability & Notifications)
 
+Person 6 extends the backend with healthcare resource availability and notification support so referral and facility workflows can check whether medicines, diagnostics, and services are currently available.
+
+#### Medicine availability
+- Maintains medicine master data through the `Medicine` model.
+- Tracks facility-level stock/availability through `MedicineInventory`.
+- Supports medicine metadata such as name, generic name, category, strength and unit.
+- Inventory records include quantity and availability state, with timestamps for freshness.
+- Medicine availability can be consumed as part of the combined facility resource availability flow.
+
+#### Diagnostic availability
+- Maintains diagnostic test definitions through `DiagnosticTest`.
+- Tracks facility-level diagnostic availability through `DiagnosticAvailability`.
+- Supports diagnostic metadata and availability status with timestamps.
+- Diagnostic availability is exposed alongside medicine and service availability for facility/resource checks.
+
+#### Service availability
+- Maintains reusable service definitions through `Service`.
+- Tracks real-time facility service availability through `ServiceAvailability`.
+- Each availability record is unique per service/facility pair and includes a `lastUpdated` timestamp.
+- This is intentionally separate from the existing `FacilityService` Smart Referral model so the two modules can coexist without replacing Person 4's facility-service data.
+
+#### Notifications
+- Provides `Notification` records linked optionally to a user and/or patient.
+- Notification categories include follow-up due/overdue, referral updates, medicine unavailable, diagnostic unavailable, emergency escalation, teleconsultation scheduling and general notifications.
+- Notification priorities are `LOW`, `MEDIUM`, `HIGH` and `URGENT`.
+- Availability changes can generate notifications, allowing frontend clients to surface important resource changes.
+
+#### Resource and availability API surface
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/medicines` | List medicines / availability information |
+| POST | `/api/medicines` | Create or update medicine resource data |
+| GET | `/api/diagnostics` | List diagnostic tests / availability information |
+| POST | `/api/diagnostics` | Create or update diagnostic resource data |
+| GET | `/api/services` | List services |
+| POST | `/api/services` | Create a service |
+| POST | `/api/services/availability` | Update facility service availability |
+| GET | `/api/services/:id/availability` | Get availability for a service |
+| GET | `/api/resources/:facilityId` | Get combined medicine, diagnostic and service availability for a facility |
+| GET | `/api/notifications` | List notifications |
+| GET | `/api/notifications/unread-count` | Get unread notification count |
+| PATCH | `/api/notifications/:id/read` | Mark a notification as read |
+| PATCH | `/api/notifications/read-all` | Mark all notifications as read |
+
+> Availability responses include timestamps so clients can distinguish current information from stale resource data.
+
+#### Module 6 integration notes
+- Resource availability is facility-specific.
+- Service availability uses `ServiceAvailability`; the Smart Referral `FacilityService` model remains intact.
+- Notifications are stored in the database and can reference both a patient and a user.
+- Module 6 is designed to feed resource availability into the broader referral/facility workflow.
+- Use the existing authentication/authorization middleware when calling protected write endpoints.
 ---
 
 ## Role Permissions Summary
