@@ -37,4 +37,21 @@ export const fetchTeleconsultDoctors = (role) =>
   api.get('/api/teleconsult-doctors', { params: role ? { role } : {} })
 export const fetchTeleconsultDoctor  = id => api.get(`/api/teleconsult-doctors/${id}`)
 
+// ── Patient Clinical Data ─────────────────────────────────────────────────────
+export const fetchPatientTimeline  = id => api.get(`/api/patients/${id}/timeline`)
+export const fetchPatientReferrals = id => api.get(`/api/patients/${id}/referrals`)
+export const fetchPatientFollowUps = (id, params) => api.get(`/api/patients/${id}/followups`, { params })
+
+// ── Vitals ────────────────────────────────────────────────────────────────────
+export const recordVitals = data => api.post('/api/vitals', data)
+
+// ── Referrals ─────────────────────────────────────────────────────────────────
+export const fetchReferrals      = params => api.get('/api/referrals', { params })
+export const updateReferralStatus = (id, data) => api.patch(`/api/referrals/${id}/status`, data)
+
+// ── Follow-ups ────────────────────────────────────────────────────────────────
+export const fetchAssignedFollowUps = params => api.get('/api/followups/assigned', { params })
+export const fetchOverdueFollowUps  = () => api.get('/api/followups/overdue')
+export const updateFollowUp         = (id, data) => api.patch(`/api/followups/${id}`, data)
+
 export default api

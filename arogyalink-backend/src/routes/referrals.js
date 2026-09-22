@@ -56,7 +56,7 @@ router.post(
 router.get(
   '/',
   authenticate,
-  authorize(ROLES.DOCTOR, ROLES.SPECIALIST, ROLES.HOSPITAL_ADMIN),
+  authorize(ROLES.ASHA, ROLES.ANM, ROLES.DOCTOR, ROLES.SPECIALIST, ROLES.HOSPITAL_ADMIN),
   getFacilityReferrals
 );
 

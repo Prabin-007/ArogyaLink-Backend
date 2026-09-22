@@ -1,7 +1,7 @@
 import { useNavigate, useLocation } from 'react-router-dom'
 import {
   LayoutDashboard, Video, Users, Stethoscope, ClipboardList,
-  Bell, LogOut, Search, UserCheck, Activity, HeartPulse
+  Bell, LogOut, Search, UserCheck, Activity, HeartPulse, FileText
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 import { useSocket } from '../context/SocketContext'
@@ -25,6 +25,8 @@ const FIELD_NAV = [
   { icon: Video,           label: 'Teleconsultation', path: '/teleconsultations/new' },
   { icon: Users,           label: 'Patients',         path: '/patients' },
   { icon: Stethoscope,     label: 'Doctors',          path: '/doctors' },
+  { icon: ClipboardList, label: 'Referrals',    path: '/referrals' },
+  { icon: FileText,      label: 'Follow-ups',   path: '/follow-ups' },
   { icon: ClipboardList,   label: 'My Requests',      path: '/dashboard', disabled: false },
 ]
 
@@ -33,6 +35,8 @@ const DOCTOR_NAV = [
   { icon: Activity,        label: 'Live Queue',   path: '/dashboard' },
   { icon: Video,           label: 'Video Rooms',  path: '/dashboard' },
   { icon: Users,           label: 'Patients',     path: '/patients' },
+  { icon: ClipboardList, label: 'Referrals',    path: '/referrals' },
+  { icon: FileText,      label: 'Follow-ups',   path: '/follow-ups' },
   { icon: UserCheck,       label: 'My History',   path: '/dashboard' },
   { icon: HeartPulse,      label: 'Health Data',  path: '/dashboard', disabled: true },
 ]

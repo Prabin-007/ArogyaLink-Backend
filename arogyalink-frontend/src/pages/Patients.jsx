@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Users, Search, RefreshCw, MapPin, Phone, Calendar } from 'lucide-react'
 import { fetchPatients } from '../services/api'
 import AppShell from '../components/AppShell'
@@ -9,6 +10,7 @@ function calcAge(dob) {
 }
 
 export default function Patients() {
+  const navigate = useNavigate()
   const [patients, setPatients] = useState([])
   const [loading, setLoading]   = useState(true)
   const [error, setError]       = useState('')
@@ -80,7 +82,7 @@ export default function Patients() {
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                       <div className="avatar sm">{(p.name || '?')[0]}</div>
                       <div>
-                        <div style={{ fontWeight: 700 }}>{p.name}</div>
+                        <div style={{ fontWeight: 700, cursor: 'pointer', color: 'var(--brand)' }} onClick={() => navigate(`/patients/${p.id}/timeline`)}>{p.name}</div>
                         <div style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'monospace' }}>{p.id.slice(0, 8)}…</div>
                       </div>
                     </div>

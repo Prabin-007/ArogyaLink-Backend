@@ -58,12 +58,12 @@ const login = async (req, res, next) => {
     const { identifier, password, role } = req.body;
 
     // ── Validate required fields ──────────────────────────────────────────────
-    if (!identifier || !password || !role) {
-      return errorResponse(res, 'identifier, password, and role are required.', 400);
+    if (!identifier || !password) {
+      return errorResponse(res, 'identifier and password are required.', 400);
     }
 
-    // ── Validate role value ───────────────────────────────────────────────────
-    if (!VALID_ROLES.includes(role)) {
+    // ── Validate role value (if provided) ───────────────────────────────────────────────────
+    if (role && !VALID_ROLES.includes(role)) {
       return errorResponse(
         res,
         `Invalid role "${role}". Valid roles: ${VALID_ROLES.join(', ')}`,
@@ -71,19 +71,26 @@ const login = async (req, res, next) => {
       );
     }
 
-    // ── Look up the user by identifier + role ─────────────────────────────────
-    // We search both fields so two users with the same identifier but different
-    // roles don't collide (e.g., two staff members with ID "101").
-    const user = await prisma.user.findFirst({
-      where: {
-        identifier,
-        role,
-      },
-    });
+    // ── Look up the user ─────────────────────────────────
+    let user;
+    if (role) {
+      // If role is provided, search by both fields
+      user = await prisma.user.findFirst({
+        where: {
+          identifier,
+          role,
+        },
+      });
+    } else {
+      // If role is NOT provided, use findUnique since identifier is unique
+      user = await prisma.user.findUnique({
+        where: { identifier },
+      });
+    }
 
     // ── User not found → generic error (don't reveal whether identifier or password is wrong) ──
     if (!user) {
-      return errorResponse(res, 'Invalid credentials. Please check your ID and role.', 401);
+      return errorResponse(res, 'Invalid credentials. Please check your ID and password.', 401);
     }
 
     // ── Check if the account is active ───────────────────────────────────────

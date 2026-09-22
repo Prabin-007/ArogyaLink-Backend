@@ -18,9 +18,6 @@ const { successResponse, errorResponse } = require('../utils/responseHelper');
 
 const router = express.Router();
 
-// All routes require authentication.
-router.use(authenticate);
-
 // Fields safe to expose to any authenticated user browsing the doctor directory.
 const SAFE_FIELDS = {
   id:         true,
@@ -67,7 +64,7 @@ router.get('/', async (req, res) => {
 /**
  * Returns the profile of a single doctor or specialist by id.
  */
-router.get('/:id', async (req, res) => {
+router.get('/:id', authenticate, async (req, res) => {
   try {
     const doctor = await prisma.user.findFirst({
       where: { id: req.params.id, role: { in: ['DOCTOR', 'SPECIALIST'] }, isActive: true },

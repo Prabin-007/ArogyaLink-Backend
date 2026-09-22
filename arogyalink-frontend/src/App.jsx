@@ -7,6 +7,10 @@ import TeleconsultationRoom from './pages/TeleconsultationRoom'
 import Patients from './pages/Patients'
 import DoctorDirectory from './pages/DoctorDirectory'
 import NewTeleconsultation from './pages/NewTeleconsultation'
+import GuestDashboard from './pages/GuestDashboard'
+import PatientTimeline from './pages/PatientTimeline'
+import Referrals from './pages/Referrals'
+import FollowUps from './pages/FollowUps'
 
 function ProtectedRoute({ children, roles }) {
   const { user } = useAuth()
@@ -21,7 +25,8 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={user ? <Navigate to="/dashboard" replace /> : <Login />} />
-      <Route path="/" element={<Navigate to={user ? '/dashboard' : '/login'} replace />} />
+      <Route path="/" element={user ? <Navigate to="/dashboard" replace /> : <GuestDashboard />} />
+      <Route path="/guest" element={<GuestDashboard />} />
 
       {/* Shared dashboard — role-aware */}
       <Route path="/dashboard" element={
@@ -50,6 +55,27 @@ export default function App() {
       <Route path="/patients" element={
         <ProtectedRoute>
           <Patients />
+        </ProtectedRoute>
+      } />
+
+      {/* Patient clinical timeline */}
+      <Route path="/patients/:id/timeline" element={
+        <ProtectedRoute>
+          <PatientTimeline />
+        </ProtectedRoute>
+      } />
+
+      {/* Referrals management */}
+      <Route path="/referrals" element={
+        <ProtectedRoute>
+          <Referrals />
+        </ProtectedRoute>
+      } />
+
+      {/* Follow-ups management */}
+      <Route path="/follow-ups" element={
+        <ProtectedRoute>
+          <FollowUps />
         </ProtectedRoute>
       } />
 

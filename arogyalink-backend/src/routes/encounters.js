@@ -20,6 +20,7 @@ const { authenticate, authorize } = require('../middleware/auth');
 const {
   createEncounter,
   getEncounter,
+  listEncounters,
 } = require('../controllers/encounterController');
 
 const router = express.Router();
@@ -38,6 +39,12 @@ router.post(
   authorize('ASHA', 'ANM', 'DOCTOR'),
   createEncounter
 );
+
+// =============================================================================
+// LIST ENCOUNTERS
+// GET /api/encounters
+// =============================================================================
+router.get('/', listEncounters);
 
 // =============================================================================
 // GET SINGLE ENCOUNTER

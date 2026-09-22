@@ -210,11 +210,29 @@ const listPatientEncounters = async (patientId) => {
 };
 
 // =============================================================================
+// LIST ENCOUNTERS (Express Handler)
+// =============================================================================
+
+const listEncounters = async (req, res, next) => {
+  try {
+    const { patientId } = req.query;
+    if (!patientId) {
+      return errorResponse(res, 'Query parameter patientId is required', 400);
+    }
+    const encounters = await listPatientEncounters(patientId);
+    return successResponse(res, { encounters }, 'Encounters fetched successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
+// =============================================================================
 // EXPORTS
 // =============================================================================
 
 module.exports = {
   createEncounter,
   getEncounter,
+  listEncounters,
   listPatientEncounters, // Exported for internal use by other modules
 };

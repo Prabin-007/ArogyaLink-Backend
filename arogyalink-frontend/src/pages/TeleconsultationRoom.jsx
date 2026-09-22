@@ -5,7 +5,20 @@ import { useAuth } from '../context/AuthContext'
 import { useSocket } from '../context/SocketContext'
 import { completeTeleconsult } from '../services/api'
 
-const ICE_SERVERS = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] }
+function buildIceConfig() {
+  const servers = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ]
+  const turnUrl = import.meta.env.VITE_TURN_SERVER_URL
+  const turnUser = import.meta.env.VITE_TURN_USERNAME
+  const turnPass = import.meta.env.VITE_TURN_PASSWORD
+  if (turnUrl && turnUser && turnPass) {
+    servers.push({ urls: turnUrl, username: turnUser, credential: turnPass })
+  }
+  return { iceServers: servers }
+}
+const ICE_SERVERS = buildIceConfig()
 const CHUNK_MS = 3000
 
 const LANGUAGES = {
