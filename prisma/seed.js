@@ -39,6 +39,84 @@ const FACILITIES = [
   { id: 'MC-DEMO-001',   name: 'Demo Medical College & Hospital Pune', type: 'MEDICAL_COLLEGE', latitude: 18.5310, longitude: 73.8740, phone: '020-5550-0401' },
 ];
 
+// Service master data and availability links for the same demo facilities.
+// The seeding logic below creates only missing records, preserving any existing
+// services and availability data.
+const SERVICES = [
+  {
+    name: 'General Consultation',
+    category: 'Clinical',
+    description: 'Outpatient medical consultations',
+    facilityIds: ['PHC-DEMO-001', 'PHC-DEMO-002', 'PHC-DEMO-003', 'CHC-DEMO-001', 'DH-DEMO-001', 'MC-DEMO-001'],
+  },
+  {
+    name: 'Emergency Care',
+    category: 'Emergency',
+    description: 'Emergency assessment and stabilisation',
+    facilityIds: ['CHC-DEMO-001', 'DH-DEMO-001', 'MC-DEMO-001'],
+  },
+  {
+    name: 'Teleconsultation',
+    category: 'Specialist Care',
+    description: 'Remote consultation with a specialist',
+    facilityIds: ['PHC-DEMO-001', 'PHC-DEMO-002', 'PHC-DEMO-003', 'CHC-DEMO-001', 'DH-DEMO-001'],
+  },
+  {
+    name: 'X-Ray',
+    category: 'Imaging',
+    description: 'Diagnostic X-ray imaging',
+    facilityIds: ['CHC-DEMO-001', 'DH-DEMO-001', 'MC-DEMO-001'],
+  },
+  {
+    name: 'Ultrasound',
+    category: 'Imaging',
+    description: 'Ultrasound diagnostic imaging',
+    facilityIds: ['DH-DEMO-001', 'MC-DEMO-001'],
+  },
+  {
+    name: 'ECG',
+    category: 'Diagnostics',
+    description: 'Electrocardiogram testing',
+    facilityIds: ['PHC-DEMO-001', 'PHC-DEMO-002', 'PHC-DEMO-003', 'CHC-DEMO-001', 'DH-DEMO-001', 'MC-DEMO-001'],
+  },
+  {
+    name: 'Minor Surgery',
+    category: 'Surgical',
+    description: 'Minor surgical procedures',
+    facilityIds: ['CHC-DEMO-001', 'DH-DEMO-001', 'MC-DEMO-001'],
+  },
+  {
+    name: 'Maternal Care',
+    category: 'Maternal and Child Health',
+    description: 'Antenatal, delivery, and postnatal care',
+    facilityIds: ['SC-DEMO-001', 'SC-DEMO-002', 'SC-DEMO-003', 'SC-DEMO-004', 'PHC-DEMO-001', 'PHC-DEMO-002', 'PHC-DEMO-003', 'CHC-DEMO-001', 'DH-DEMO-001', 'MC-DEMO-001'],
+  },
+  {
+    name: 'Child Care',
+    category: 'Maternal and Child Health',
+    description: 'Child health and immunisation services',
+    facilityIds: ['SC-DEMO-001', 'SC-DEMO-002', 'SC-DEMO-003', 'SC-DEMO-004', 'PHC-DEMO-001', 'PHC-DEMO-002', 'PHC-DEMO-003', 'CHC-DEMO-001', 'DH-DEMO-001', 'MC-DEMO-001'],
+  },
+  {
+    name: 'Pharmacy',
+    category: 'Support Services',
+    description: 'Dispensing of medicines and supplies',
+    facilityIds: ['PHC-DEMO-001', 'PHC-DEMO-002', 'PHC-DEMO-003', 'CHC-DEMO-001', 'DH-DEMO-001', 'MC-DEMO-001'],
+  },
+  {
+    name: 'Ambulance Service',
+    category: 'Emergency',
+    description: 'Patient transport for emergencies and referrals',
+    facilityIds: ['CHC-DEMO-001', 'DH-DEMO-001', 'MC-DEMO-001'],
+  },
+  {
+    name: 'Laboratory Services',
+    category: 'Diagnostics',
+    description: 'Routine laboratory investigations',
+    facilityIds: ['PHC-DEMO-001', 'PHC-DEMO-002', 'PHC-DEMO-003', 'CHC-DEMO-001', 'DH-DEMO-001', 'MC-DEMO-001'],
+  },
+];
+
 // Two ASHAs (the second lets the tests prove ASHA A cannot touch ASHA B's
 // patients) and one doctor.
 const USERS = [
@@ -53,6 +131,50 @@ async function main() {
     await prisma.facility.upsert({ where: { id: f.id }, update: data, create: data });
   }
   console.log(`✔ Seeded ${FACILITIES.length} demo facilities (${DISTRICT}, ${STATE})`);
+
+  let createdServices = 0;
+  let createdAvailabilityRecords = 0;
+
+  for (const demoService of SERVICES) {
+    const { facilityIds, ...serviceData } = demoService;
+    let service = await prisma.service.findFirst({
+      where: { name: serviceData.name },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (!service) {
+      service = await prisma.service.create({
+        data: serviceData,
+      });
+      createdServices += 1;
+    }
+
+    for (const facilityId of facilityIds) {
+      const existingAvailability = await prisma.facilityService.findUnique({
+        where: {
+          serviceId_facilityId: {
+            serviceId: service.id,
+            facilityId,
+          },
+        },
+      });
+
+      if (!existingAvailability) {
+        await prisma.facilityService.create({
+          data: {
+            serviceId: service.id,
+            facilityId,
+            available: true,
+          },
+        });
+        createdAvailabilityRecords += 1;
+      }
+    }
+  }
+  console.log(
+    'âœ” Seeded ' + createdServices + ' new demo services and ' +
+      createdAvailabilityRecords + ' new service availability records'
+  );
 
   const passwordHash = await bcrypt.hash(DEMO_PASSWORD, 10);
   for (const u of USERS) {

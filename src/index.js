@@ -103,6 +103,20 @@ app.use('/api/followups',     require('./routes/followups'));
 // ── Facility Reference List ────────────────────────────────────────────────────
 app.use('/api/facilities',   require('./routes/facilities'));
 
+// ── Medicines & Medicine Availability ─────────────────────────────────────────
+app.use('/api/medicines',    require('./routes/medicines'));
+app.use('/api/services',     require('./routes/services'));
+
+// ── Diagnostic Availability ─────────────────────────────────────────
+app.use('/api/diagnostics', require('./routes/diagnostics'));
+
+// ── Notification followup ─────────────────────────────────────────
+app.use('/api/notifications', require('./routes/notifications'));
+
+// ── Resource Availability ─────────────────────────────────────────
+app.use('/api/resources', require('./routes/resources'));
+
+
 // ── Offline Data Synchronization ───────────────────────────────────────────────
 app.use('/api/sync',          require('./routes/sync'));
 
