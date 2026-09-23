@@ -110,6 +110,11 @@ const referralRoutes = require('./routes/referrals');
 app.use('/api/referrals',     referralRoutes);
 app.use('/referrals',         referralRoutes);
 
+// ---- Digital Triage------------------------
+const triageRoutes = require('./routes/triage');
+app.use('/api/triage', triageRoutes);
+app.use('/triage', triageRoutes);
+
 // ── Follow-Up Management ───────────────────────────────────────────────────────
 const followupRoutes = require('./routes/followups');
 app.use('/api/followups',     followupRoutes);

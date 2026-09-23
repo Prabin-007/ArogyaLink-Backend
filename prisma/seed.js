@@ -35,8 +35,8 @@ const FACILITIES = [
   { id: 'PHC-DEMO-002',  name: 'Demo PHC Mulshi',              type: 'PHC',               latitude: 18.5200, longitude: 73.5200, phone: '020-5550-0102' },
   { id: 'PHC-DEMO-003',  name: 'Demo PHC Bhor',                type: 'PHC',               latitude: 18.1600, longitude: 73.8500, phone: '020-5550-0103' },
   { id: 'CHC-DEMO-001',  name: 'Demo Community Health Centre Pirangut', type: 'CHC',      latitude: 18.5330, longitude: 73.6850, phone: '020-5550-0201' },
-  { id: 'DH-DEMO-001',   name: 'Demo District Hospital Pune',  type: 'DISTRICT_HOSPITAL', latitude: 18.5204, longitude: 73.8567, phone: '020-5550-0301' },
-  { id: 'MC-DEMO-001',   name: 'Demo Medical College & Hospital Pune', type: 'MEDICAL_COLLEGE', latitude: 18.5310, longitude: 73.8740, phone: '020-5550-0401' },
+  { id: 'DH-DEMO-001',   name: 'Demo District Hospital Pune',  type: 'DISTRICT_HOSPITAL', latitude: 18.5204, longitude: 73.8567, phone: '020-5550-0301', emergencyCapability: true},
+  { id: 'MC-DEMO-001',   name: 'Demo Medical College & Hospital Pune', type: 'MEDICAL_COLLEGE', latitude: 18.5310, longitude: 73.8740, phone: '020-5550-0401', emergencyCapability: true},
 ];
 
 // Two ASHAs (the second lets the tests prove ASHA A cannot touch ASHA B's
