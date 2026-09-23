@@ -106,6 +106,7 @@ const createReferral = async (req, res, next) => {
       preferredSpecialistGender,
       emergency = false,
       requiredDiagnostics = [],
+      requiredMedicines = [],
     } = req.body;
 
     const resolvedReferringFacilityId = referringFacilityId || req.user?.facilityId || 'Saswad PHC';
@@ -162,6 +163,7 @@ const createReferral = async (req, res, next) => {
         priority,
         emergency: emergency === true || emergency === 'true',
         requiredDiagnostics: Array.isArray(requiredDiagnostics) ? requiredDiagnostics : [],
+        requiredMedicines:   Array.isArray(requiredMedicines) ? requiredMedicines : [],
       });
 
       if (result.noEligibleFacilities) {
@@ -247,6 +249,21 @@ const createReferral = async (req, res, next) => {
 
       return newReferral;
     });
+
+    // ── Dispatch Notification (Person 6 integration) ────────────────────────
+    try {
+      const { createNotification } = require('../utils/notificationService');
+      await createNotification({
+        patientId: referral.patientId,
+        userId: patient.assignedAshaId || null,
+        type: 'REFERRAL_UPDATE',
+        priority: referral.priority === 'EMERGENCY' ? 'URGENT' : (referral.priority === 'HIGH' ? 'HIGH' : 'MEDIUM'),
+        title: `New ${referral.priority} Referral Created`,
+        message: `Referral created for ${patient.name} to ${referral.receivingFacilityId}. Reason: ${referral.reason}`,
+      });
+    } catch (notifErr) {
+      // Non-blocking
+    }
 
     // ── Build response ────────────────────────────────────────────────────────
     // Response is enriched with Smart Referral data when in smart mode.
@@ -440,6 +457,20 @@ const updateReferralStatus = async (req, res, next) => {
       return updated;
     });
 
+    // ── Dispatch Notification on status update (Person 6 integration) ───────
+    try {
+      const { createNotification } = require('../utils/notificationService');
+      await createNotification({
+        patientId: existingReferral.patientId,
+        type: 'REFERRAL_UPDATE',
+        priority: updatedReferral.priority === 'EMERGENCY' ? 'URGENT' : 'MEDIUM',
+        title: `Referral Status: ${newStatus}`,
+        message: `Referral for patient updated from ${previousStatus} to ${newStatus}.${remarks ? ` Remarks: ${remarks}` : ''}`,
+      });
+    } catch (notifErr) {
+      // Non-blocking
+    }
+
     return successResponse(
       res,
       { referral: updatedReferral },
@@ -530,9 +561,56 @@ const getFacilityReferrals = async (req, res, next) => {
   }
 };
 
+// =============================================================================
+// getRecommendation (Stand-alone AI recommendation query)
+// =============================================================================
+/**
+ * POST /api/referrals/recommend
+ * Returns smart facility recommendations without persisting a referral.
+ * Useful for the frontend referral wizard to let doctors preview facilities.
+ */
+const getRecommendation = async (req, res, next) => {
+  try {
+    const {
+      patientLatitude,
+      patientLongitude,
+      requiredService,
+      requiredSpecialist,
+      preferredSpecialistGender,
+      priority = 'MEDIUM',
+      emergency = false,
+      requiredDiagnostics = [],
+      requiredMedicines = [],
+    } = req.body;
+
+    if (patientLatitude == null || patientLongitude == null) {
+      return errorResponse(res, 'patientLatitude and patientLongitude are required.', 400);
+    }
+
+    const { getSmartReferralRecommendation } = require('../services/smartReferralService');
+
+    const result = await getSmartReferralRecommendation({
+      patientLatitude: parseFloat(patientLatitude),
+      patientLongitude: parseFloat(patientLongitude),
+      requiredService,
+      requiredSpecialist,
+      preferredSpecialistGender,
+      priority,
+      emergency: emergency === true || emergency === 'true',
+      requiredDiagnostics: Array.isArray(requiredDiagnostics) ? requiredDiagnostics : [],
+      requiredMedicines: Array.isArray(requiredMedicines) ? requiredMedicines : [],
+    });
+
+    return successResponse(res, result, 'Smart referral recommendations computed successfully.');
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   createReferral,
   getReferral,
   updateReferralStatus,
   getFacilityReferrals,
+  getRecommendation,
 };

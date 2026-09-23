@@ -120,6 +120,32 @@ const facilityRoutes = require('./routes/facilities');
 app.use('/api/facilities',   facilityRoutes);
 app.use('/facilities',       facilityRoutes);
 
+// ── Medicines & Medicine Availability (Person 6) ──────────────────────────────
+const medicineRoutes = require('./routes/medicines');
+app.use('/api/medicines',    medicineRoutes);
+app.use('/medicines',        medicineRoutes);
+
+// ── Service Catalog & Service Availability (Person 6) ─────────────────────────
+const serviceRoutes = require('./routes/services');
+app.use('/api/services',     serviceRoutes);
+app.use('/services',         serviceRoutes);
+
+// ── Diagnostic Catalog & Diagnostic Availability (Person 6) ───────────────────
+const diagnosticRoutes = require('./routes/diagnostics');
+app.use('/api/diagnostics',  diagnosticRoutes);
+app.use('/diagnostics',      diagnosticRoutes);
+
+// ── Notification System (Person 6) ────────────────────────────────────────────
+const notificationRoutes = require('./routes/notifications');
+app.use('/api/notifications', notificationRoutes);
+app.use('/notifications',     notificationRoutes);
+
+// ── Resource Multi-Availability (Person 6) ────────────────────────────────────
+const resourceRoutes = require('./routes/resources');
+app.use('/api/resources',    resourceRoutes);
+app.use('/resources',        resourceRoutes);
+
+
 // ── Offline Data Synchronization ───────────────────────────────────────────────
 const syncRoutes = require('./routes/sync');
 app.use('/api/sync',          syncRoutes);

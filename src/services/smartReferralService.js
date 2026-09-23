@@ -76,6 +76,7 @@ function filterEligibleFacilities(facilities, requirements) {
     requiredSpecialist,
     emergency = false,
     requiredDiagnostics = [],
+    requiredMedicines = [],
   } = requirements;
 
   const eligible = [];
@@ -102,7 +103,20 @@ function filterEligibleFacilities(facilities, requirements) {
 
     // ── Rule 3: Required service must not be explicitly marked unavailable ────
     if (requiredService) {
-      const serviceRecord = facility.services.find(
+      // Check Person 6 dynamic ServiceAvailability first
+      const dynamicServiceRecord = facility.serviceAvailability?.find(
+        (sa) => sa.service && sa.service.name.toUpperCase() === requiredService.toUpperCase()
+      );
+      if (dynamicServiceRecord && !dynamicServiceRecord.available) {
+        excluded.push({
+          facility,
+          reason: `Required service "${requiredService}" is currently out of service (real-time resource status)`,
+        });
+        continue;
+      }
+
+      // Check Person 4 FacilityService
+      const serviceRecord = facility.services?.find(
         (s) => s.serviceName.toUpperCase() === requiredService.toUpperCase()
       );
       if (serviceRecord && !serviceRecord.available) {
@@ -128,6 +142,7 @@ function filterEligibleFacilities(facilities, requirements) {
 
 /**
  * Service availability score (0–1).
+ * Checks Person 6 real-time ServiceAvailability and Person 4 FacilityService.
  * 1.0 if the service is available or not required.
  * 0.5 if the service is not listed (may or may not have it).
  * 0.0 if the service is listed as unavailable.
@@ -135,13 +150,22 @@ function filterEligibleFacilities(facilities, requirements) {
 function calcServiceScore(facility, requiredService) {
   if (!requiredService) return 1.0; // No requirement → full marks
 
-  const serviceRecord = facility.services.find(
+  // 1. Check Person 6 dynamic ServiceAvailability
+  const dynamicRecord = facility.serviceAvailability?.find(
+    (sa) => sa.service && sa.service.name.toUpperCase() === requiredService.toUpperCase()
+  );
+  if (dynamicRecord) {
+    return dynamicRecord.available ? 1.0 : 0.0;
+  }
+
+  // 2. Check Person 4 FacilityService
+  const serviceRecord = facility.services?.find(
     (s) => s.serviceName.toUpperCase() === requiredService.toUpperCase()
   );
 
   if (!serviceRecord) return 0.5;   // Unknown – facility might have it
   if (serviceRecord.available) return 1.0;
-  return 0.0; // Explicitly unavailable (shouldn't reach here after filter, but defensive)
+  return 0.0; // Explicitly unavailable
 }
 
 /**
@@ -201,16 +225,25 @@ function calcEmergencyScore(facility) {
 }
 
 /**
- * Resource/diagnostic availability score (0–1).
- * 1.0 if all required diagnostics are available (or none required).
- * Partial credit for partial availability.
+ * Diagnostic equipment availability score (0–1).
+ * Checks Person 6 real-time DiagnosticAvailability and Person 4 FacilityResource.
  */
-function calcResourceScore(facility, requiredDiagnostics = []) {
+function calcDiagnosticScore(facility, requiredDiagnostics = []) {
   if (!requiredDiagnostics || requiredDiagnostics.length === 0) return 1.0;
 
   let found = 0;
   for (const diag of requiredDiagnostics) {
-    const resourceRecord = facility.resources.find(
+    // 1. Check Person 6 dynamic DiagnosticAvailability
+    const dynamicDiag = facility.diagnosticAvailability?.find(
+      (da) => da.test && da.test.name.toUpperCase() === diag.toUpperCase()
+    );
+    if (dynamicDiag) {
+      if (dynamicDiag.available) found++;
+      continue;
+    }
+
+    // 2. Check Person 4 FacilityResource
+    const resourceRecord = facility.resources?.find(
       (r) => r.resourceName.toUpperCase() === diag.toUpperCase()
     );
     if (resourceRecord && resourceRecord.available) {
@@ -219,6 +252,49 @@ function calcResourceScore(facility, requiredDiagnostics = []) {
   }
 
   return found / requiredDiagnostics.length;
+}
+
+/**
+ * Medicine availability score (0–1).
+ * Checks Person 6 real-time MedicineInventory.
+ */
+function calcMedicineScore(facility, requiredMedicines = []) {
+  if (!requiredMedicines || requiredMedicines.length === 0) return 1.0;
+
+  let inStockCount = 0;
+  for (const med of requiredMedicines) {
+    const inv = facility.medicineInventory?.find(
+      (item) => item.medicine && item.medicine.name.toUpperCase() === med.toUpperCase()
+    );
+    if (inv && inv.quantity > 0) {
+      inStockCount++;
+    }
+  }
+
+  return inStockCount / requiredMedicines.length;
+}
+
+/**
+ * Combined resource/diagnostic/medicine availability score (0–1).
+ * 1.0 if all required diagnostics & medicines are available (or none required).
+ * Partial credit for partial availability.
+ */
+function calcResourceScore(facility, requiredDiagnostics = [], requiredMedicines = []) {
+  const hasDiags = requiredDiagnostics && requiredDiagnostics.length > 0;
+  const hasMeds = requiredMedicines && requiredMedicines.length > 0;
+
+  if (!hasDiags && !hasMeds) return 1.0;
+
+  const diagScore = calcDiagnosticScore(facility, requiredDiagnostics);
+  const medScore = calcMedicineScore(facility, requiredMedicines);
+
+  if (hasDiags && hasMeds) {
+    return (diagScore * 0.5) + (medScore * 0.5);
+  }
+  if (hasDiags) {
+    return diagScore;
+  }
+  return medScore;
 }
 
 // =============================================================================
@@ -238,6 +314,7 @@ function scoreFacility(facility, distanceKm, requirements, weightProfile = 'STAN
     requiredService,
     requiredSpecialist,
     requiredDiagnostics = [],
+    requiredMedicines = [],
   } = requirements;
 
   const weights = REFERRAL_WEIGHTS[weightProfile] || REFERRAL_WEIGHTS.STANDARD;
@@ -248,7 +325,7 @@ function scoreFacility(facility, distanceKm, requirements, weightProfile = 'STAN
   const distanceScore   = calcDistanceScore(distanceKm);
   const waitingScore    = calcWaitingTimeScore(facility.waitingTimeMinutes);
   const emergencyScore  = calcEmergencyScore(facility);
-  const resourceScore   = calcResourceScore(facility, requiredDiagnostics);
+  const resourceScore   = calcResourceScore(facility, requiredDiagnostics, requiredMedicines);
 
   // ── Weighted sum ───────────────────────────────────────────────────────────
   const rawScore =
@@ -270,6 +347,8 @@ function scoreFacility(facility, distanceKm, requirements, weightProfile = 'STAN
     waitingTime:{ score: waitingScore,    weight: weights.waitingTime, weighted: waitingScore    * weights.waitingTime},
     emergency:  { score: emergencyScore,  weight: weights.emergency,   weighted: emergencyScore  * weights.emergency  },
     resources:  { score: resourceScore,   weight: weights.resources,   weighted: resourceScore   * weights.resources  },
+    diagnostics:{ score: calcDiagnosticScore(facility, requiredDiagnostics), count: requiredDiagnostics.length },
+    medicines:  { score: calcMedicineScore(facility, requiredMedicines), count: requiredMedicines.length },
   };
 
   // ── Build human-readable reasons (explainability) ─────────────────────────
@@ -363,13 +442,27 @@ function buildReasons(facility, distanceKm, requirements, breakdown) {
     reasons.push('Waiting time not reported');
   }
 
-  // Diagnostics / Resources
+  // Diagnostics / Equipment (Person 4 & Person 6)
   const diags = requirements.requiredDiagnostics || [];
   if (diags.length > 0) {
     const available = [];
     const unavailable = [];
     for (const diag of diags) {
-      const rec = facility.resources.find(
+      // 1. Check Person 6 dynamic diagnostic availability
+      const dynamicRec = facility.diagnosticAvailability?.find(
+        (da) => da.test && da.test.name.toUpperCase() === diag.toUpperCase()
+      );
+      if (dynamicRec) {
+        if (dynamicRec.available) {
+          available.push(diag);
+        } else {
+          unavailable.push(diag);
+        }
+        continue;
+      }
+
+      // 2. Check Person 4 FacilityResource
+      const rec = facility.resources?.find(
         (r) => r.resourceName.toUpperCase() === diag.toUpperCase()
       );
       if (rec && rec.available) {
@@ -383,6 +476,29 @@ function buildReasons(facility, distanceKm, requirements, breakdown) {
     }
     if (unavailable.length > 0) {
       reasons.push(`Diagnostics not confirmed: ${unavailable.join(', ')}`);
+    }
+  }
+
+  // Medicines (Person 6 real-time inventory)
+  const meds = requirements.requiredMedicines || [];
+  if (meds.length > 0) {
+    const inStock = [];
+    const outOfStock = [];
+    for (const med of meds) {
+      const inv = facility.medicineInventory?.find(
+        (m) => m.medicine && m.medicine.name.toUpperCase() === med.toUpperCase()
+      );
+      if (inv && inv.quantity > 0) {
+        inStock.push(`${med} (${inv.quantity} in stock)`);
+      } else {
+        outOfStock.push(med);
+      }
+    }
+    if (inStock.length > 0) {
+      reasons.push(`Medicines in stock: ${inStock.join(', ')}`);
+    }
+    if (outOfStock.length > 0) {
+      reasons.push(`⚠️ Medicines OUT OF STOCK: ${outOfStock.join(', ')}`);
     }
   }
 
@@ -493,6 +609,7 @@ async function getSmartReferralRecommendation(params) {
     priority = 'MEDIUM',
     emergency = false,
     requiredDiagnostics = [],
+    requiredMedicines = [],
   } = params;
 
   // ── Determine scoring profile ─────────────────────────────────────────────
@@ -505,6 +622,7 @@ async function getSmartReferralRecommendation(params) {
     preferredSpecialistGender,
     emergency: isEmergency,
     requiredDiagnostics,
+    requiredMedicines,
   };
 
   const facilities = await prisma.facility.findMany({
@@ -512,6 +630,21 @@ async function getSmartReferralRecommendation(params) {
       services:    true,
       specialists: true,
       resources:   true,
+      medicineInventory: {
+        include: {
+          medicine: true,
+        },
+      },
+      diagnosticAvailability: {
+        include: {
+          test: true,
+        },
+      },
+      serviceAvailability: {
+        include: {
+          service: true,
+        },
+      },
     },
   });
 
@@ -561,6 +694,22 @@ async function getSmartReferralRecommendation(params) {
     waitingTimeMinutes: item.facility.waitingTimeMinutes,
     emergencyCapability: item.facility.emergencyCapability,
     reasons:      item.reasons,
+    medicineInventory: item.facility.medicineInventory?.map((m) => ({
+      medicineId: m.medicineId,
+      name: m.medicine?.name,
+      strength: m.medicine?.strength,
+      quantity: m.quantity,
+    })) || [],
+    diagnosticAvailability: item.facility.diagnosticAvailability?.map((d) => ({
+      testId: d.testId,
+      testName: d.test?.name,
+      available: d.available,
+    })) || [],
+    serviceAvailability: item.facility.serviceAvailability?.map((s) => ({
+      serviceId: s.serviceId,
+      serviceName: s.service?.name,
+      available: s.available,
+    })) || [],
   });
 
   const bestOverall = ranked[0];
@@ -607,4 +756,6 @@ module.exports = {
   calcSpecialistScore,
   calcEmergencyScore,
   calcResourceScore,
+  calcDiagnosticScore,
+  calcMedicineScore,
 };

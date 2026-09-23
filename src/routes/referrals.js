@@ -29,9 +29,20 @@ const {
   getReferral,
   updateReferralStatus,
   getFacilityReferrals,
+  getRecommendation,
 } = require('../controllers/referralController');
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/referrals/recommend
+ * Preview AI facility recommendations based on distance, live inventory, and readiness.
+ */
+router.post(
+  '/recommend',
+  authenticate,
+  getRecommendation
+);
 
 /**
  * POST /api/referrals

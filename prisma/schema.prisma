@@ -145,6 +145,44 @@ enum FacilityOperationalStatus {
   MAINTENANCE           // Under maintenance
 }
 
+enum NotificationType {
+  FOLLOWUP_DUE
+  FOLLOWUP_OVERDUE
+  REFERRAL_UPDATE
+  MEDICINE_UNAVAILABLE
+  DIAGNOSTIC_UNAVAILABLE
+  EMERGENCY_ESCALATION
+  TELECONSULT_SCHEDULED
+  GENERAL
+}
+
+enum NotificationPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+model Notification {
+  id        String               @id @default(cuid())
+  userId    String?
+  patientId String?
+  type      NotificationType
+  priority  NotificationPriority @default(MEDIUM)
+  title     String
+  message   String
+  readAt    DateTime?
+  createdAt DateTime             @default(now())
+
+  user    User?    @relation(fields: [userId], references: [id])
+  patient Patient? @relation(fields: [patientId], references: [id])
+
+  @@index([userId])
+  @@index([patientId])
+  @@index([readAt])
+  @@map("notifications")
+}
+
 // =============================================================================
 // MODELS
 // =============================================================================
@@ -173,6 +211,7 @@ model User {
   referralsCreated Referral[]    @relation("ReferralCreatedBy")
   referralEvents   ReferralEvent[] @relation("ReferralEventUpdatedBy")
   followUpsAssigned FollowUp[]   @relation("FollowUpAssignedTo")
+  notifications Notification[]
 
   // Records this user last wrote (see lastModifiedById on each model)
   patientsModified   Patient[]   @relation("PatientLastModifiedBy")
@@ -219,6 +258,7 @@ model Patient {
   timeline       TimelineEvent[]
   vitals         Vitals[]
   prescriptions  Prescription[]
+  notifications Notification[]
 
   @@index([assignedAshaId]) // Fast lookup: "show me all patients for this ASHA worker"
   @@map("patients")
@@ -464,6 +504,9 @@ model Facility {
   services            FacilityService[]         // Services offered by this facility
   specialists         FacilitySpecialist[]      // Specialists available at this facility
   resources           FacilityResource[]        // Diagnostics/resources available at this facility
+  medicineInventory      MedicineInventory[]
+ diagnosticAvailability DiagnosticAvailability[]
+ serviceAvailability    ServiceAvailability[]
 
   @@index([district])
   @@index([type])
@@ -479,10 +522,11 @@ model Facility {
 // Used in Phase 1 eligibility filtering: if a required service is unavailable,
 // the facility is excluded from consideration.
 model FacilityService {
+  
   id          String   @id @default(cuid())
-  facilityId  String                        // FK → facilities.id
-  serviceName String                        // e.g., "CARDIOLOGY", "OBSTETRICS", "PEDIATRICS"
-  available   Boolean  @default(true)       // Is this service currently available?
+  facilityId  String
+  serviceName String
+  available   Boolean  @default(true)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
@@ -540,4 +584,129 @@ model FacilityResource {
   @@index([facilityId])
   @@index([resourceName, available])    // "Find all facilities with an ECG"
   @@map("facility_resources")
+}
+// =============================================================================
+// MODULE 6: RESOURCE & SERVICE AVAILABILITY
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// Medicine – master list of medicines available in ArogyaLink
+// -----------------------------------------------------------------------------
+model Medicine {
+  id          String   @id @default(cuid())
+  name        String
+  strength    String?
+  form        String?
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Facilities holding this medicine
+  inventory MedicineInventory[]
+
+  @@index([name])
+  @@map("medicines")
+}
+
+// -----------------------------------------------------------------------------
+// MedicineInventory – medicine stock at a particular facility
+// -----------------------------------------------------------------------------
+model MedicineInventory {
+  id          String   @id @default(cuid())
+  medicineId  String
+  facilityId  String
+  quantity    Int      @default(0)
+  lastUpdated DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  medicine Medicine @relation(fields: [medicineId], references: [id])
+  facility Facility @relation(fields: [facilityId], references: [id])
+
+  @@unique([medicineId, facilityId])
+  @@index([facilityId])
+  @@index([medicineId])
+  @@map("medicine_inventory")
+}
+
+// -----------------------------------------------------------------------------
+// DiagnosticTest – master list of diagnostic tests
+// -----------------------------------------------------------------------------
+model DiagnosticTest {
+  id          String   @id @default(cuid())
+  name        String
+  category    String?
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  availability DiagnosticAvailability[]
+
+  @@index([name])
+  @@map("diagnostic_tests")
+}
+
+// -----------------------------------------------------------------------------
+// DiagnosticAvailability – diagnostic availability at a facility
+// -----------------------------------------------------------------------------
+model DiagnosticAvailability {
+  id          String   @id @default(cuid())
+  testId      String
+  facilityId  String
+  available   Boolean  @default(false)
+  lastUpdated DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  test     DiagnosticTest @relation(fields: [testId], references: [id])
+  facility Facility       @relation(fields: [facilityId], references: [id])
+
+  @@unique([testId, facilityId])
+  @@index([facilityId])
+  @@index([testId])
+  @@map("diagnostic_availability")
+}
+
+// -----------------------------------------------------------------------------
+// Service – master catalogue of healthcare services
+// -----------------------------------------------------------------------------
+model Service {
+  id           String   @id @default(cuid())
+  name         String
+  category     String?
+  description  String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  availability ServiceAvailability[]
+
+  @@index([name])
+  @@map("services")
+}
+
+// -----------------------------------------------------------------------------
+// ServiceAvailability – real-time service availability
+// -----------------------------------------------------------------------------
+// IMPORTANT:
+// This is intentionally separate from Person 4's FacilityService.
+//
+// FacilityService:
+//   Existing Smart Referral facility capability.
+//
+// ServiceAvailability:
+//   Module 6 real-time availability with lastUpdated timestamp.
+// -----------------------------------------------------------------------------
+model ServiceAvailability {
+  id          String   @id @default(cuid())
+  serviceId   String
+  facilityId  String
+  available   Boolean  @default(false)
+  lastUpdated DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  service  Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  facility Facility @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  @@unique([serviceId, facilityId])
+  @@index([facilityId])
+  @@index([serviceId])
+  @@map("service_availability")
 }
