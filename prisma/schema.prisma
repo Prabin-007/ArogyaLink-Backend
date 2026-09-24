@@ -183,6 +183,15 @@ model Notification {
   @@map("notifications")
 }
 
+// The lifecycle of a teleconsultation request, mirroring ReferralStatus shape
+enum TeleconsultationStatus {
+  CREATED    // Request raised by ASHA / ANM / PHC Doctor
+  ACCEPTED   // Doctor/Specialist accepted; roomId generated; Encounter created
+  REJECTED   // Doctor/Specialist declined
+  CANCELLED  // Requester cancelled before acceptance
+  COMPLETED  // Call ended and marked done
+}
+
 // =============================================================================
 // MODELS
 // =============================================================================
@@ -218,6 +227,10 @@ model User {
   encountersModified Encounter[] @relation("EncounterLastModifiedBy")
   vitalsModified     Vitals[]    @relation("VitalsLastModifiedBy")
   followUpsModified  FollowUp[]  @relation("FollowUpLastModifiedBy")
+
+  // Teleconsultation back-relations
+  teleconsultAsDoctor    TeleconsultationRequest[] @relation("TeleconsultDoctor")
+  teleconsultAsRequester TeleconsultationRequest[] @relation("TeleconsultRequester")
 
   @@map("users") // Maps to snake_case table name in PostgreSQL
 }
@@ -259,6 +272,7 @@ model Patient {
   vitals         Vitals[]
   prescriptions  Prescription[]
   notifications Notification[]
+  teleconsultations TeleconsultationRequest[]
 
   @@index([assignedAshaId]) // Fast lookup: "show me all patients for this ASHA worker"
   @@map("patients")
@@ -709,4 +723,37 @@ model ServiceAvailability {
   @@index([facilityId])
   @@index([serviceId])
   @@map("service_availability")
+}
+
+// =============================================================================
+// TeleconsultationRequest – remote consultation lifecycle (Person 2)
+// =============================================================================
+model TeleconsultationRequest {
+  id          String                 @id @default(cuid())
+
+  patientId   String
+  patient     Patient                @relation(fields: [patientId], references: [id])
+
+  doctorId    String
+  doctor      User                   @relation("TeleconsultDoctor", fields: [doctorId], references: [id])
+
+  requesterId String
+  requester   User                   @relation("TeleconsultRequester", fields: [requesterId], references: [id])
+
+  reason      String
+
+  status      TeleconsultationStatus @default(CREATED)
+
+  roomId      String?
+
+  encounterId String?                @unique
+
+  createdAt   DateTime               @default(now())
+  updatedAt   DateTime               @updatedAt
+
+  @@index([patientId])
+  @@index([doctorId])
+  @@index([requesterId])
+  @@index([status])
+  @@map("teleconsultation_requests")
 }

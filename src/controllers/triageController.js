@@ -130,6 +130,7 @@ const assessAndRefer = async (req, res, next) => {
     const { encounterId } = req.params;
 
     const {
+      patientId: bodyPatientId,
       patientLatitude,
       patientLongitude,
       referringFacilityId,
@@ -143,22 +144,49 @@ const assessAndRefer = async (req, res, next) => {
       symptoms: bodySymptoms,
     } = req.body;
 
-    // --------------------------------------------------
-    // Fetch encounter + latest vitals
-    // --------------------------------------------------
+    let encounter = null;
+    let targetPatientId = bodyPatientId;
 
-    const encounter = await prisma.encounter.findUnique({
-      where: { id: encounterId },
-      include: {
-        vitals: true,
-        patient: true,
-      },
-    });
+    if (encounterId && encounterId !== 'adhoc' && encounterId !== 'direct') {
+      encounter = await prisma.encounter.findUnique({
+        where: { id: encounterId },
+        include: {
+          vitals: true,
+          patient: true,
+        },
+      });
+      if (encounter) {
+        targetPatientId = encounter.patientId;
+      }
+    }
+
+    // If ad-hoc or encounter not found, but patientId is provided, generate a clinical encounter
+    if (!encounter && targetPatientId) {
+      const patient = await prisma.patient.findUnique({
+        where: { id: targetPatientId },
+      });
+      if (!patient) {
+        return errorResponse(res, `Patient with ID "${targetPatientId}" not found`, 404);
+      }
+
+      encounter = await prisma.encounter.create({
+        data: {
+          patientId: targetPatientId,
+          doctorId: req.user?.id || null,
+          facilityId: referringFacilityId || req.user?.facilityId || 'PHC-DEMO-001',
+          encounterType: 'EMERGENCY',
+          symptoms: Array.isArray(bodySymptoms) ? bodySymptoms : [],
+          clinicalNotes: customReason || 'Auto-created during Emergency Triage Assessment',
+          encounterDate: new Date(),
+        },
+        include: { patient: true, vitals: true },
+      });
+    }
 
     if (!encounter) {
       return errorResponse(
         res,
-        `Encounter with ID "${encounterId}" not found`,
+        `Encounter "${encounterId}" not found and no patientId provided`,
         404
       );
     }

@@ -16,12 +16,15 @@
 // This makes process.env.DATABASE_URL, process.env.PORT, etc. available.
 require('dotenv').config();
 
+const http = require('http');
 const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
+const { Server } = require('socket.io');
 
 // Internal imports
 const errorHandler = require('./middleware/errorHandler');
+const { registerTeleconsultationSocket } = require('./socket/teleconsultationSocket');
 
 // ─── App Initialization ────────────────────────────────────────────────────────
 const app = express();
@@ -156,6 +159,14 @@ const syncRoutes = require('./routes/sync');
 app.use('/api/sync',          syncRoutes);
 app.use('/sync',              syncRoutes);
 
+// ── Teleconsultation (WebRTC + Socket.io - Person 2) ───────────────────────────
+const teleconsultationRoutes = require('./routes/teleconsultationRoutes');
+const teleconsultDoctorsRoutes = require('./routes/teleconsultDoctorsRoutes');
+app.use('/api/teleconsultations',   teleconsultationRoutes);
+app.use('/teleconsultations',       teleconsultationRoutes);
+app.use('/api/teleconsult-doctors', teleconsultDoctorsRoutes);
+app.use('/teleconsult-doctors',     teleconsultDoctorsRoutes);
+
 // ─── 404 Handler ──────────────────────────────────────────────────────────────
 /**
  * Catches any request to a route that doesn't exist.
@@ -177,12 +188,26 @@ app.use((req, res) => {
  */
 app.use(errorHandler);
 
+// ─── HTTP Server + Socket.io (WebRTC Signaling) ───────────────────────────────
+const httpServer = http.createServer(app);
+
+const io = new Server(httpServer, {
+  cors: {
+    origin: process.env.CLIENT_ORIGIN || '*',
+    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'],
+  },
+});
+
+app.set('io', io);
+registerTeleconsultationSocket(io);
+
 // ─── Start Server ─────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+httpServer.listen(PORT, () => {
   console.log('');
   console.log('🚀 ArogyaLink Backend Server is running!');
   console.log(`📡 URL:         http://localhost:${PORT}`);
   console.log(`❤️  Health:      http://localhost:${PORT}/health`);
+  console.log(`🔌 Socket.io:   ws://localhost:${PORT} (teleconsultation WebRTC signaling)`);
   console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`🔐 Auth:        ${process.env.AUTH_ENABLED === 'true' ? 'ENABLED' : 'DISABLED (dev mode)'}`);
   console.log('');
