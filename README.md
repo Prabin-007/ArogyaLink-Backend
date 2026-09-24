@@ -43,13 +43,15 @@ Health check: **http://localhost:3001/health**
 
 The seed script is idempotent and loads **fictional** demo data only. Never run it against real data.
 
-| Role | Login `identifier` | Password |
-|------|--------------------|----------|
-| ASHA (main demo user) | `ASHA-DEMO-001` | `Demo@1234` |
-| ASHA (second, for testing access control) | `ASHA-DEMO-002` | `Demo@1234` |
-| DOCTOR | `DOC-DEMO-001` | `Demo@1234` |
+| Role | Login `identifier` | Password | Name |
+|------|--------------------|----------|------|
+| ASHA (main demo user) | `ASHA-DEMO-001` | `Demo@123` / `Demo@1234` | Sunita Patil |
+| ASHA (second, access control) | `ASHA-DEMO-002` | `Demo@123` / `Demo@1234` | Rekha Jadhav |
+| ASHA (third, field consultation) | `ASHA-DEMO-003` | `Demo@123` / `Demo@1234` | Kavita More |
+| DOCTOR (primary PHC doctor) | `DOC-DEMO-001` | `Demo@123` / `Demo@1234` | Dr. Demo Kulkarni |
+| DOCTOR (teleconsult doctor) | `DOC-DEMO-002` | `Demo@123` / `Demo@1234` | Dr. Sneha Deshmukh |
 
-Login: `POST /api/auth/login` with `{ "identifier": "ASHA-DEMO-001", "password": "Demo@1234", "role": "ASHA" }`.
+Login: `POST /api/auth/login` with `{ "identifier": "ASHA-DEMO-001", "password": "Demo@123", "role": "ASHA" }`.
 
 It also creates 10 fictional health facilities in **Pune district, Maharashtra** with IDs like `PHC-DEMO-001`, `SC-DEMO-001`, `CHC-DEMO-001`, `DH-DEMO-001`, `MC-DEMO-001`.
 

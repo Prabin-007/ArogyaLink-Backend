@@ -19,7 +19,7 @@ const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
 // Shared by all demo users. Documented in README.md.
-const DEMO_PASSWORD = 'Demo@1234';
+const DEMO_PASSWORD = 'Demo@123';
 
 const DISTRICT = 'Pune';
 const STATE = 'Maharashtra';
@@ -117,12 +117,13 @@ const SERVICES = [
   },
 ];
 
-// Two ASHAs (the second lets the tests prove ASHA A cannot touch ASHA B's
-// patients) and one doctor.
+// Three ASHAs and two doctors for comprehensive demo & teleconsultation.
 const USERS = [
-  { identifier: 'ASHA-DEMO-001', role: 'ASHA',   name: 'Demo ASHA One (Sunita Patil)', phone: '9000000001' },
-  { identifier: 'ASHA-DEMO-002', role: 'ASHA',   name: 'Demo ASHA Two (Rekha Jadhav)', phone: '9000000002' },
-  { identifier: 'DOC-DEMO-001',  role: 'DOCTOR', name: 'Dr. Demo Kulkarni',            phone: '9000000101' },
+  { identifier: 'ASHA-DEMO-001', role: 'ASHA',   name: 'Demo ASHA One (Sunita Patil)',  phone: '9000000001' },
+  { identifier: 'ASHA-DEMO-002', role: 'ASHA',   name: 'Demo ASHA Two (Rekha Jadhav)',  phone: '9000000002' },
+  { identifier: 'ASHA-DEMO-003', role: 'ASHA',   name: 'Demo ASHA Three (Kavita More)', phone: '9000000003' },
+  { identifier: 'DOC-DEMO-001',  role: 'DOCTOR', name: 'Dr. Demo Kulkarni',             phone: '9000000101' },
+  { identifier: 'DOC-DEMO-002',  role: 'DOCTOR', name: 'Dr. Sneha Deshmukh',            phone: '9000000102' },
 ];
 
 async function main() {
