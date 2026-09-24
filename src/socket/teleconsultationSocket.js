@@ -36,16 +36,6 @@ function registerTeleconsultationSocket(io) {
       socket.data.userId = userId;
       socket.data.role   = role;
       socket.to(roomId).emit('user-joined', { userId, role, socketId: socket.id });
-
-      try {
-        const room = io?.sockets?.adapter?.rooms?.get?.(roomId);
-        if (room && room.size > 1) {
-          socket.emit('peer-already-in-room', { peerCount: room.size });
-        }
-      } catch (err) {
-        // adapter may be absent in test mocks
-      }
-
       console.log(`[Socket] ${socket.id} (${role}) joined room ${roomId}`);
     });
 
