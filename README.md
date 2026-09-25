@@ -45,11 +45,11 @@ The seed script is idempotent and loads **fictional** demo data only. Never run 
 
 | Role | Login `identifier` | Password | Name |
 |------|--------------------|----------|------|
-| ASHA (main demo user) | `ASHA-DEMO-001` | `Demo@123` / `Demo@1234` | Sunita Patil |
-| ASHA (second, access control) | `ASHA-DEMO-002` | `Demo@123` / `Demo@1234` | Rekha Jadhav |
-| ASHA (third, field consultation) | `ASHA-DEMO-003` | `Demo@123` / `Demo@1234` | Kavita More |
-| DOCTOR (primary PHC doctor) | `DOC-DEMO-001` | `Demo@123` / `Demo@1234` | Dr. Demo Kulkarni |
-| DOCTOR (teleconsult doctor) | `DOC-DEMO-002` | `Demo@123` / `Demo@1234` | Dr. Sneha Deshmukh |
+| ASHA (main demo user) | `ASHA-DEMO-001` | `Demo@123` | Sunita Patil |
+| ASHA (second, access control) | `ASHA-DEMO-002` | `Demo@123` | Rekha Jadhav |
+| ASHA (third, field consultation) | `ASHA-DEMO-003` | `Demo@123` | Kavita More |
+| DOCTOR (primary PHC doctor) | `DOC-DEMO-001` | `Demo@123` | Dr. Demo Kulkarni |
+| DOCTOR (teleconsult doctor) | `DOC-DEMO-002` | `Demo@123` | Dr. Sneha Deshmukh |
 
 Login: `POST /api/auth/login` with `{ "identifier": "ASHA-DEMO-001", "password": "Demo@123", "role": "ASHA" }`.
 
