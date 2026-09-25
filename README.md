@@ -45,11 +45,11 @@ The seed script is idempotent and loads **fictional** demo data only. Never run 
 
 | Role | Login `identifier` | Password | Name |
 |------|--------------------|----------|------|
-| ASHA (main demo user) | `ASHA-DEMO-001` | `Demo@123` / `Demo@1234` | Sunita Patil |
-| ASHA (second, access control) | `ASHA-DEMO-002` | `Demo@123` / `Demo@1234` | Rekha Jadhav |
-| ASHA (third, field consultation) | `ASHA-DEMO-003` | `Demo@123` / `Demo@1234` | Kavita More |
-| DOCTOR (primary PHC doctor) | `DOC-DEMO-001` | `Demo@123` / `Demo@1234` | Dr. Demo Kulkarni |
-| DOCTOR (teleconsult doctor) | `DOC-DEMO-002` | `Demo@123` / `Demo@1234` | Dr. Sneha Deshmukh |
+| ASHA (main demo user) | `ASHA-DEMO-001` | `Demo@123` | Sunita Patil |
+| ASHA (second, access control) | `ASHA-DEMO-002` | `Demo@123` | Rekha Jadhav |
+| ASHA (third, field consultation) | `ASHA-DEMO-003` | `Demo@123` | Kavita More |
+| DOCTOR (primary PHC doctor) | `DOC-DEMO-001` | `Demo@123` | Dr. Demo Kulkarni |
+| DOCTOR (teleconsult doctor) | `DOC-DEMO-002` | `Demo@123` | Dr. Sneha Deshmukh |
 
 Login: `POST /api/auth/login` with `{ "identifier": "ASHA-DEMO-001", "password": "Demo@123", "role": "ASHA" }`.
 
@@ -208,6 +208,24 @@ Response data (array of timeline events):
 ```
 
 #### GET `/api/patients?village=Rampur&search=Meena&page=1&limit=20`
+
+Optional `?triageLevel=EMERGENCY|REFER_SOON|WATCH|ROUTINE` returns only patients whose **latest assessment** (by `completedAt`, the phone's time) has that level; any other value → `400`. Without it the response is unchanged.
+
+#### GET `/api/patients/:id/assessments`
+
+Roles: `DOCTOR`, `SPECIALIST`, `HOSPITAL_ADMIN`, `SYSTEM_ADMIN` (others → `403`; unknown patient → `404`). For the doctor dashboard: the structured forms an ASHA completed for this patient, **newest first** by `completedAt`.
+
+```json
+Response data:
+{ "patientId": "…",
+  "assessments": [
+    { "id": "…", "formId": "anc_visit", "formVersion": 2, "answers": { "…": "…" }, "score": 7,
+      "triageLevel": "REFER_SOON", "triageReasons": ["BP >= 140/90"],
+      "serverTriageLevel": "HIGH", "serverTriageScore": 5, "serverTriageReasons": ["Low oxygen saturation"],
+      "completedAt": "…", "recordedBy": { "id": "…", "name": "…", "role": "ASHA" }, "…": "…" } ] }
+```
+
+`triageLevel` = the phone's rule-based result; `serverTriage*` = the server's own engine (a different scale, may be `null`) — see the sync section.
 
 ---
 
@@ -393,7 +411,7 @@ All responses use the standard envelope `{ success, message, data, timestamp }`.
 2. **Existing records keep their ids.** Records created on the web have server-generated ids (cuid-style, e.g. `cmfx…`). Those are valid as `id` / foreign keys when *updating* or *referencing* something the server already has. A **new** record must have a UUID.
 3. **Idempotent.** Re-sending a batch (e.g. the response was lost) never creates duplicates — not rows, not timeline events.
 4. **Per-record results.** One bad record never blocks the others. Mark exactly the records whose result is `ok` as synced.
-5. **Processing order** (fixed by the server): patients → encounters → vitals → follow-ups. Array order inside the request does not matter.
+5. **Processing order** (fixed by the server): patients → encounters → vitals → assessments → follow-ups. Array order inside the request does not matter.
 6. **What the phone can and cannot write**
 
 | Record | Phone can create | Phone can update | Notes |
@@ -401,6 +419,7 @@ All responses use the standard envelope `{ success, message, data, timestamp }`.
 | Patient | ✅ (assigned to herself) | ✅ her own patients | `assignedAshaId` defaults to you; cannot be changed from the phone |
 | Encounter | ✅ (incl. `HOME_VISIT`) | ✅ | `doctorId`, `facilityId` optional; `encounterDate` honoured |
 | Vitals | ✅ | ✅ | `recordedAt` honoured; `recordedById` is always the logged-in user |
+| Assessment | ✅ (for her patients) | ✅ answers / score / triage result | `completedAt` (phone time) honoured; `recordedById` is always the logged-in user; `patientId`, `encounterId`, `formId`, `formVersion` fixed once created |
 | Follow-up | ✅ (for her patients, assigned to herself) | ✅ **status / outcome / notes only**, on follow-ups assigned to her | past `dueDate` is fine offline |
 | **Referral** | ❌ **doctors / specialists only (web)** | ❌ | **Download only.** Uploading one returns a per-record `error` |
 | **Prescription** | ❌ doctors only | ❌ | **Download only** |
@@ -428,7 +447,7 @@ Rules that stay server-authoritative: **referral status** (only doctors/hospital
 
 #### POST `/api/sync/upload`
 
-Request (all four arrays optional; unknown fields are ignored):
+Request (every array is optional; unknown fields are ignored):
 
 ```json
 {
@@ -484,9 +503,25 @@ Request (all four arrays optional; unknown fields are ignored):
 
 Field reference (creating):
 
-* **Required** — patient: `id, name, dateOfBirth, gender, village, district, state`; encounter: `id, patientId, encounterType`; vitals: `id, patientId` + at least one measurement; follow-up: `id, patientId, dueDate`.
-* **Optional** — patient: `phone, address, category (GENERAL|PREGNANT|CHILD_UNDER_5|NCD|ELDERLY), lmpDate, isHighRisk, riskReasons, createdAt`; encounter: `doctorId, facilityId, symptoms, clinicalNotes, encounterDate`; vitals: `encounterId, temperature, heartRate, bpSystolic, bpDiastolic, oxygenSaturation, weight, recordedAt`; follow-up: `relatedEncounterId, relatedReferralId, assignedToId (must be you), status, outcome, notes, completedAt, createdAt`.
+* **Required** — patient: `id, name, dateOfBirth, gender, village, district, state`; encounter: `id, patientId, encounterType`; vitals: `id, patientId` + at least one measurement; assessment: `id, patientId, formId, formVersion, answers, triageLevel, completedAt`; follow-up: `id, patientId, dueDate`.
+* **Optional** — patient: `phone, address, category (GENERAL|PREGNANT|CHILD_UNDER_5|NCD|ELDERLY), lmpDate, isHighRisk, riskReasons, createdAt`; encounter: `doctorId, facilityId, symptoms, clinicalNotes, encounterDate`; vitals: `encounterId, temperature, heartRate, bpSystolic, bpDiastolic, oxygenSaturation, weight, recordedAt`; assessment: `encounterId, score, triageReasons`; follow-up: `relatedEncounterId, relatedReferralId, assignedToId (must be you), status, outcome, notes, completedAt, createdAt`.
 * All timestamps are ISO-8601 strings.
+
+**Assessments** (`records.assessments`) — a completed structured form. Same rules as vitals: UUID id, ownership through the patient, idempotent, `baseUpdatedAt` concurrency, per-record results (`"type": "assessment"`).
+
+```json
+{ "id": "6b0e…", "patientId": "3f2b…", "encounterId": "a1b2…",
+  "formId": "anc_visit", "formVersion": 2,
+  "answers": { "headache": "severe", "weeks_pregnant": 30 },
+  "score": 7,
+  "triageLevel": "REFER_SOON", "triageReasons": ["BP >= 140/90", "Severe headache"],
+  "completedAt": "2026-09-23T10:00:00.000Z" }
+```
+
+* `triageLevel` is the **phone's own rule-based result**: `EMERGENCY | REFER_SOON | WATCH | ROUTINE`. The server stores it as sent.
+* `answers` is a JSON object (question key → answer, any JSON value). Compared by content, so re-sending the same answers is a no-op even if the key order differs.
+* The server adds a **separate** triage result to the row when it saves — `serverTriageLevel` (`EMERGENCY | HIGH | MEDIUM | LOW`), `serverTriageScore`, `serverTriageReasons` — by running the existing rule engine (`src/services/triageService.js`) on the patient's **latest vitals** and, if `encounterId` is set, that **encounter's symptoms**. It is `null` when there were no vitals and no symptoms. The phone can't set these (they are ignored on upload) and must not confuse them with `triageLevel`; they come back in the download and in `serverRecord`.
+* Saving an assessment does **not** create a referral. Referrals stay a doctor's action.
 
 Response:
 
@@ -528,13 +563,13 @@ Editing an existing record (a follow-up the doctor created, downloaded earlier w
 
 * `lastSyncedAt` missing or `"0"` → **everything** (first sync after login).
 * Otherwise returns every row with `updatedAt > lastSyncedAt`.
-* Returns **full objects** (every column) for: patients assigned to this ASHA; those patients' `encounters`, `vitals`, `prescriptions` and `referrals` (with current `status`); `followups` assigned to this ASHA; and `facilities`.
+* Returns **full objects** (every column) for: patients assigned to this ASHA; those patients' `encounters`, `vitals`, `assessments`, `prescriptions` and `referrals` (with current `status`); `followups` assigned to this ASHA; and `facilities`.
 
 ```json
 { "data": {
     "serverTimestamp": "2026-09-20T08:20:00.000Z",
     "deviceId": "pixel-7-asha-001",
-    "patients": [ "…" ], "encounters": [ "…" ], "vitals": [ "…" ], "prescriptions": [ "…" ],
+    "patients": [ "…" ], "encounters": [ "…" ], "vitals": [ "…" ], "assessments": [ "…" ], "prescriptions": [ "…" ],
     "referrals": [ "…" ], "followups": [ "…" ], "facilities": [ "…" ] } }
 ```
 
@@ -545,7 +580,7 @@ Editing an existing record (a follow-up the doctor created, downloaded earlier w
 
 #### Timeline
 
-Every synced record creates the **same** timeline event as the equivalent web endpoint (`PATIENT_REGISTERED`, `ENCOUNTER_CREATED`, `VITALS_RECORDED`, `FOLLOWUP_SCHEDULED`, `FOLLOWUP_COMPLETED` / `MISSED` / `ESCALATED`), visible in `GET /api/patients/:id/timeline`. Events are stamped with the record's own time (`createdAt` / `encounterDate` / `recordedAt`), not the sync time, so late-synced visits appear in the right place.
+Every synced record creates the **same** timeline event as the equivalent web endpoint (`PATIENT_REGISTERED`, `ENCOUNTER_CREATED`, `VITALS_RECORDED`, `ASSESSMENT_COMPLETED` (triage level + reasons in the description; written once, when the assessment is first created), `FOLLOWUP_SCHEDULED`, `FOLLOWUP_COMPLETED` / `MISSED` / `ESCALATED`), visible in `GET /api/patients/:id/timeline`. Events are stamped with the record's own time (`createdAt` / `encounterDate` / `recordedAt`), not the sync time, so late-synced visits appear in the right place.
 
 When a patient's `isHighRisk` goes **false → true** (via sync or the regular patient endpoints) a **`HIGH_RISK_FLAGGED`** event is added, with the `riskReasons` in its description. This is how doctors notice high-risk patients.
 
@@ -753,6 +788,7 @@ npm test
 - Create emergency encounters: `POST /api/encounters` with `encounterType: "EMERGENCY"`
 - Create high-priority referrals: `POST /api/referrals` with `priority: "EMERGENCY"`
 - Escalate follow-ups: `PATCH /api/followups/:id` with `status: "ESCALATED"`
+- Assessments: when an ASHA's assessment syncs, `triageService.assessTriage` is run (unmodified) on the patient's latest vitals + the linked encounter's symptoms and stored on the assessment as `serverTriage*`. It is separate from the phone's own `triageLevel` and never creates a referral or a notification by itself — see the sync section.
 
 ### Person 6 (Medicine / Diagnostic / Service Availability & Notifications)
 

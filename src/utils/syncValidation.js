@@ -59,6 +59,7 @@ const EncounterTypeEnum = z.enum([
   'FOLLOW_UP_VISIT',
   'HOME_VISIT',
 ]);
+const AssessmentTriageLevelEnum = z.enum(['EMERGENCY', 'REFER_SOON', 'WATCH', 'ROUTINE']);
 const FollowUpStatusEnum = z.enum([
   'PENDING',
   'IN_PROGRESS',
@@ -114,6 +115,23 @@ const vitalsSchema = z.object({
   recordedAt: optionalDate, // when the ASHA actually took the readings
 });
 
+// A completed structured form. The triage fields are the PHONE's rule-based result;
+// the server's own triage output (serverTriage*) is never accepted from the phone —
+// it is not in this schema, so zod strips it if one is sent.
+const assessmentSchema = z.object({
+  id: idSchema,
+  baseUpdatedAt: optionalDate,
+  patientId: idSchema.optional(),
+  encounterId: idSchema.nullable().optional(),
+  formId: z.string().min(1).optional(), // e.g. "anc_visit"
+  formVersion: z.number().int().min(1).optional(),
+  answers: z.record(z.unknown()).optional(), // question key → answer (any JSON value)
+  score: z.number().int().nullable().optional(),
+  triageLevel: AssessmentTriageLevelEnum.optional(),
+  triageReasons: z.array(z.string()).optional(),
+  completedAt: optionalDate, // when the ASHA finished the form (phone time)
+});
+
 const followupSchema = z.object({
   id: idSchema,
   baseUpdatedAt: optionalDate,
@@ -139,6 +157,7 @@ const uploadEnvelopeSchema = z.object({
       patients: z.array(z.unknown()).optional(),
       encounters: z.array(z.unknown()).optional(),
       vitals: z.array(z.unknown()).optional(),
+      assessments: z.array(z.unknown()).optional(),
       followups: z.array(z.unknown()).optional(),
       // Accepted only so we can reject them with a clear per-record message.
       referrals: z.array(z.unknown()).optional(),
@@ -158,6 +177,7 @@ module.exports = {
   patientSchema,
   encounterSchema,
   vitalsSchema,
+  assessmentSchema,
   followupSchema,
   uploadEnvelopeSchema,
   formatZodError,

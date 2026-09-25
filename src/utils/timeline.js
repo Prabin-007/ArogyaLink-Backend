@@ -114,6 +114,26 @@ const logVitalsRecorded = (tx, vitals, measurementSummary, occurredAt) =>
     occurredAt,
   });
 
+// ─── Assessment ───────────────────────────────────────────────────────────────
+/**
+ * ASSESSMENT_COMPLETED — written once, when an assessment is first created.
+ * The triage level and reasons (the phone's rule-based result) go in the
+ * description so a doctor reading the timeline sees the outcome at a glance.
+ */
+const logAssessmentCompleted = (tx, assessment, occurredAt) => {
+  const reasons = Array.isArray(assessment.triageReasons) ? assessment.triageReasons : [];
+  return createTimelineEvent(tx, {
+    patientId: assessment.patientId,
+    eventType: 'ASSESSMENT_COMPLETED',
+    referenceId: assessment.id, // Link to the specific assessment
+    description:
+      `Assessment completed (${assessment.formId} v${assessment.formVersion}). ` +
+      `Triage: ${assessment.triageLevel}.` +
+      `${reasons.length ? ` Reasons: ${reasons.join('; ')}` : ' No reasons recorded.'}`,
+    occurredAt,
+  });
+};
+
 // ─── Follow-up ────────────────────────────────────────────────────────────────
 const logFollowUpScheduled = (tx, followUp, dueDate, assignedToId, occurredAt) =>
   createTimelineEvent(tx, {
@@ -156,6 +176,7 @@ module.exports = {
   logEncounterCreated,
   buildVitalsSummary,
   logVitalsRecorded,
+  logAssessmentCompleted,
   logFollowUpScheduled,
   logFollowUpStatusChange,
 };

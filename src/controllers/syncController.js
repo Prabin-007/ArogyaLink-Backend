@@ -93,16 +93,20 @@ const {
   patientSchema,
   encounterSchema,
   vitalsSchema,
+  assessmentSchema,
   followupSchema,
   uploadEnvelopeSchema,
   formatZodError,
 } = require('../utils/syncValidation');
+// The existing server-side rule engine (Person 5). Called, never modified — see computeServerTriage.
+const { assessTriage } = require('../services/triageService');
 const {
   logPatientRegistered,
   logHighRiskFlagged,
   logEncounterCreated,
   buildVitalsSummary,
   logVitalsRecorded,
+  logAssessmentCompleted,
   logFollowUpScheduled,
   logFollowUpStatusChange,
 } = require('../utils/timeline');
@@ -126,7 +130,17 @@ const NOT_YOURS = (what, id) => `${what} "${id}" was not found or is not assigne
 const normalise = (v) => {
   if (v instanceof Date) return v.getTime();
   if (Array.isArray(v)) return JSON.stringify(v);
+  // Json columns (assessment answers). Postgres jsonb does not keep key order, so
+  // compare with the keys sorted, or an identical retry would look like a change.
+  if (v !== null && typeof v === 'object') return canonicalJson(v);
   return v === undefined ? null : v;
+};
+const canonicalJson = (v) => {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
+  if (v !== null && typeof v === 'object') {
+    return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(v[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(v);
 };
 
 /**
@@ -430,6 +444,123 @@ const handleVitals = async (tx, rec, ctx) => {
   return toOutcome({ kind: 'created', row: vitals });
 };
 
+// ── ASSESSMENT ───────────────────────────────────────────────────────────────
+// Same rules as vitals: ownership through the patient, UUID for new records,
+// idempotent, baseUpdatedAt concurrency. patientId, encounterId, formId and
+// formVersion identify WHAT was assessed and with which form, so they are fixed
+// once created (an edit may change the answers and the phone's triage result).
+
+/**
+ * The server's own triage (existing rule engine, src/services/triageService.js),
+ * run on the patient's latest vitals and — when the assessment is linked to an
+ * encounter — that encounter's symptoms. Stored in serverTriage* and kept apart
+ * from the phone's own triageLevel so the two are never confused.
+ *
+ * Returns nulls (not a made-up "LOW") when there is nothing to assess: the engine
+ * reads vitals and symptoms only, and reports LOW for an empty input.
+ * Never throws because of the engine: an assessment must sync even if triage can't run.
+ */
+const NO_SERVER_TRIAGE = { serverTriageLevel: null, serverTriageScore: null, serverTriageReasons: [] };
+
+const computeServerTriage = async (tx, patientId, encounterId) => {
+  const vitals = await tx.vitals.findFirst({ where: { patientId }, orderBy: { recordedAt: 'desc' } });
+  const encounter = encounterId
+    ? await tx.encounter.findUnique({ where: { id: encounterId }, select: { symptoms: true } })
+    : null;
+  const symptoms = encounter?.symptoms ?? [];
+  if (!vitals && symptoms.length === 0) return NO_SERVER_TRIAGE;
+
+  try {
+    const result = assessTriage({
+      vitals: vitals
+        ? {
+            temperature: vitals.temperature,
+            heartRate: vitals.heartRate,
+            bpSystolic: vitals.bpSystolic,
+            bpDiastolic: vitals.bpDiastolic,
+            oxygenSaturation: vitals.oxygenSaturation,
+          }
+        : {},
+      symptoms,
+    });
+    return {
+      serverTriageLevel: result.triageLevel,
+      serverTriageScore: result.score,
+      serverTriageReasons: [...result.reasons, ...result.redFlags.map((f) => `Red flag: ${f}`)],
+    };
+  } catch (err) {
+    console.error('[Sync] Server-side triage failed; saving the assessment without it:', err);
+    return NO_SERVER_TRIAGE;
+  }
+};
+
+const handleAssessment = async (tx, rec, ctx) => {
+  const existing = await tx.assessment.findUnique({ where: { id: rec.id } });
+
+  // ── Update an existing assessment ──────────────────────────────────────────
+  if (existing) {
+    await getAccessiblePatient(tx, ctx, existing.patientId);
+    if (rec.patientId !== undefined && rec.patientId !== existing.patientId) {
+      throw new RecordError('patientId cannot be changed on an existing assessment.');
+    }
+    if (rec.encounterId !== undefined && rec.encounterId !== existing.encounterId) {
+      throw new RecordError('encounterId cannot be changed on an existing assessment.');
+    }
+    if (rec.formId !== undefined && rec.formId !== existing.formId) {
+      throw new RecordError('formId cannot be changed on an existing assessment.');
+    }
+    if (rec.formVersion !== undefined && rec.formVersion !== existing.formVersion) {
+      throw new RecordError('formVersion cannot be changed on an existing assessment.');
+    }
+
+    // Server triage is derived (written, not compared), so an identical retry stays "unchanged".
+    const serverTriage = await computeServerTriage(tx, existing.patientId, existing.encounterId);
+    const result = await applyOptimisticUpdate(tx, 'assessment', existing, rec.baseUpdatedAt, {
+      answers: rec.answers,
+      score: rec.score,
+      triageLevel: rec.triageLevel,
+      triageReasons: rec.triageReasons,
+      completedAt: rec.completedAt,
+    }, serverTriage, ctx.user.id);
+    return toOutcome(result);
+  }
+
+  // ── Create a new assessment ────────────────────────────────────────────────
+  requireUuidForCreate(rec.id);
+  requireForCreate(rec, ['patientId', 'formId', 'formVersion', 'answers', 'triageLevel', 'completedAt']);
+  await getAccessiblePatient(tx, ctx, rec.patientId);
+
+  // Same integrity rule as vitals: the encounter must exist and belong to this patient.
+  if (rec.encounterId) {
+    const encounter = await tx.encounter.findUnique({ where: { id: rec.encounterId } });
+    if (!encounter || encounter.patientId !== rec.patientId) {
+      throw new RecordError(`Encounter "${rec.encounterId}" does not exist for this patient.`);
+    }
+  }
+
+  const serverTriage = await computeServerTriage(tx, rec.patientId, rec.encounterId ?? null);
+  const assessment = await tx.assessment.create({
+    data: {
+      id: rec.id,
+      patientId: rec.patientId,
+      encounterId: rec.encounterId ?? null,
+      formId: rec.formId,
+      formVersion: rec.formVersion,
+      answers: rec.answers,
+      score: rec.score ?? null,
+      triageLevel: rec.triageLevel,
+      triageReasons: rec.triageReasons ?? [],
+      completedAt: rec.completedAt, // the phone's time
+      ...serverTriage,
+      recordedById: ctx.user.id, // always the authenticated user — never trusted from the payload
+      lastModifiedById: ctx.user.id,
+    },
+  });
+
+  await logAssessmentCompleted(tx, assessment, assessment.completedAt);
+  return toOutcome({ kind: 'created', row: assessment });
+};
+
 // ── FOLLOW-UP ────────────────────────────────────────────────────────────────
 const handleFollowup = async (tx, rec, ctx) => {
   const existing = await tx.followUp.findUnique({ where: { id: rec.id } });
@@ -542,12 +673,15 @@ const handleFollowup = async (tx, rec, ctx) => {
 
 /**
  * Processing order matters: parents must exist before children reference them.
- * patients → encounters → vitals → followups (referrals/prescriptions are not uploadable).
+ * patients → encounters → vitals → assessments → followups
+ * (referrals/prescriptions are not uploadable). Assessments come after vitals so the
+ * server-side triage that runs when one is saved can see vitals from the same batch.
  */
 const UPLOAD_PIPELINE = [
   { key: 'patients', type: 'patient', schema: patientSchema, handler: handlePatient },
   { key: 'encounters', type: 'encounter', schema: encounterSchema, handler: handleEncounter },
   { key: 'vitals', type: 'vitals', schema: vitalsSchema, handler: handleVitals },
+  { key: 'assessments', type: 'assessment', schema: assessmentSchema, handler: handleAssessment },
   { key: 'followups', type: 'followup', schema: followupSchema, handler: handleFollowup },
 ];
 
@@ -625,6 +759,7 @@ const processRecord = async ({ type, schema, handler }, raw, ctx) => {
  *     patients?:   PatientRecord[],
  *     encounters?: EncounterRecord[],
  *     vitals?:     VitalsRecord[],
+ *     assessments?: AssessmentRecord[],
  *     followups?:  FollowUpRecord[]
  *   }
  * }
@@ -698,7 +833,7 @@ const uploadOfflineData = async (req, res, next) => {
  * Returns FULL objects (every column the app needs to fill its local database)
  * for everything that changed since `lastSyncedAt`:
  *   patients assigned to this ASHA, and those patients' encounters, vitals,
- *   prescriptions and referrals (with their current status); follow-ups
+ *   assessments, prescriptions and referrals (with their current status); follow-ups
  *   assigned to this ASHA; and the facilities list.
  *
  * "Changed" means `updatedAt > lastSyncedAt` on every table.
@@ -740,7 +875,7 @@ const downloadUpdates = async (req, res, next) => {
     // Only this ASHA's patients (relation filter — no giant id list needed).
     const myPatient = { patient: { assignedAshaId: req.user.id } };
 
-    const [patients, encounters, vitals, prescriptions, referrals, followups, facilities] =
+    const [patients, encounters, vitals, assessments, prescriptions, referrals, followups, facilities] =
       await Promise.all([
         prisma.patient.findMany({
           where: { assignedAshaId: req.user.id, ...changed },
@@ -748,6 +883,7 @@ const downloadUpdates = async (req, res, next) => {
         }),
         prisma.encounter.findMany({ where: { ...myPatient, ...changed }, orderBy: { updatedAt: 'asc' } }),
         prisma.vitals.findMany({ where: { ...myPatient, ...changed }, orderBy: { updatedAt: 'asc' } }),
+        prisma.assessment.findMany({ where: { ...myPatient, ...changed }, orderBy: { updatedAt: 'asc' } }),
         prisma.prescription.findMany({ where: { ...myPatient, ...changed }, orderBy: { updatedAt: 'asc' } }),
         // Referral status is set by doctors/hospitals — the ASHA only ever reads it.
         prisma.referral.findMany({ where: { ...myPatient, ...changed }, orderBy: { updatedAt: 'asc' } }),
@@ -766,6 +902,7 @@ const downloadUpdates = async (req, res, next) => {
         patients,
         encounters,
         vitals,
+        assessments,
         prescriptions,
         referrals,
         followups,
