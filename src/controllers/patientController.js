@@ -24,6 +24,7 @@ const { logPatientRegistered, logHighRiskFlagged } = require('../utils/timeline'
 
 // ─── ASHA-work fields (added for mobile sync v2, all optional) ────────────────
 const VALID_CATEGORIES = ['GENERAL', 'PREGNANT', 'CHILD_UNDER_5', 'NCD', 'ELDERLY'];
+const VALID_TRIAGE_LEVELS = ['EMERGENCY', 'REFER_SOON', 'WATCH', 'ROUTINE'];
 
 const CATEGORY_ALIASES = {
   PREGNANT_WOMAN: 'PREGNANT',
@@ -374,6 +375,45 @@ const getPatientTimeline = async (req, res, next) => {
 };
 
 // =============================================================================
+// GET PATIENT ASSESSMENTS
+// =============================================================================
+
+/**
+ * GET /api/patients/:id/assessments
+ *
+ * Every assessment (structured form) completed for a patient, newest first
+ * (by completedAt — the phone's time — then createdAt). For the doctor dashboard.
+ *
+ * `triageLevel` / `triageReasons` are the phone's rule-based result;
+ * `serverTriageLevel` / `serverTriageReasons` (EMERGENCY|HIGH|MEDIUM|LOW) come from
+ * the server's own triage engine and may be null.
+ */
+const getPatientAssessments = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const patient = await prisma.patient.findUnique({ where: { id } });
+    if (!patient) {
+      return errorResponse(res, `Patient with ID "${id}" not found`, 404);
+    }
+
+    const assessments = await prisma.assessment.findMany({
+      where: { patientId: id },
+      include: { recordedBy: { select: { id: true, name: true, role: true } } },
+      orderBy: [{ completedAt: 'desc' }, { createdAt: 'desc' }],
+    });
+
+    return successResponse(
+      res,
+      { patientId: id, assessments },
+      'Patient assessments fetched successfully'
+    );
+  } catch (error) {
+    next(error);
+  }
+};
+
+// =============================================================================
 // GET PATIENT FOLLOW-UPS
 // =============================================================================
 
@@ -502,7 +542,9 @@ const getPatientReferrals = async (req, res, next) => {
  *   ?village=        — Filter patients by village name (case-insensitive)
  *   ?assignedAshaId= — Filter patients by their assigned ASHA worker ID
  *   ?search=         — Search by patient name OR phone number (case-insensitive)
- *   ?page=1          — Page number (default: 1)
+ *   ?triageLevel=    — Only patients whose latest assessment has this level:
+ *                      EMERGENCY | REFER_SOON | WATCH | ROUTINE (else 400)
+ *   ?page=1         — Page number (default: 1)
  *   ?limit=20        — Results per page (default: 20, max: 100)
  *
  * Response includes pagination metadata (total count, current page, total pages)
@@ -514,7 +556,7 @@ const getPatientReferrals = async (req, res, next) => {
  */
 const listPatients = async (req, res, next) => {
   try {
-    const { village, assignedAshaId, search } = req.query;
+    const { village, assignedAshaId, search, triageLevel } = req.query;
 
     // ── Pagination ────────────────────────────────────────────────────────────
     const page  = Math.max(1, parseInt(req.query.page,  10) || 1);    // min page = 1
@@ -541,6 +583,27 @@ const listPatients = async (req, res, next) => {
         { name:  { contains: search, mode: 'insensitive' } },
         { phone: { contains: search, mode: 'insensitive' } },
       ];
+    }
+
+    // ?triageLevel= → patients whose LATEST assessment has that (phone-computed) level.
+    // "Latest" = most recent completedAt (the phone's time), newest createdAt breaking ties.
+    // Prisma cannot filter on "the latest related row", so one raw query finds the ids.
+    if (triageLevel !== undefined) {
+      if (!VALID_TRIAGE_LEVELS.includes(triageLevel)) {
+        return errorResponse(
+          res,
+          `Invalid triageLevel. Valid values: ${VALID_TRIAGE_LEVELS.join(', ')}`,
+          400
+        );
+      }
+      const latest = await prisma.$queryRaw`
+        SELECT "patientId" FROM (
+          SELECT DISTINCT ON ("patientId") "patientId", "triageLevel"
+          FROM "assessments"
+          ORDER BY "patientId", "completedAt" DESC, "createdAt" DESC, "id" DESC
+        ) AS latest
+        WHERE "triageLevel" = ${triageLevel}::"AssessmentTriageLevel"`;
+      where.id = { in: latest.map((row) => row.patientId) };
     }
 
     // ── Execute Query + Count ─────────────────────────────────────────────────
@@ -591,6 +654,7 @@ module.exports = {
   getPatient,
   updatePatient,
   getPatientTimeline,
+  getPatientAssessments,
   getPatientFollowUps,
   getPatientReferrals,
   listPatients,

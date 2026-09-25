@@ -13,6 +13,7 @@
  *   GET    /:id               → Get a single patient by ID (all authenticated roles)
  *   PUT    /:id               → Update patient details (field workers + doctors)
  *   GET    /:id/timeline      → Get patient's event timeline (all roles)
+ *   GET    /:id/assessments   → Get patient's assessments, newest first (doctor/specialist/admins)
  *   GET    /:id/followups     → Get patient's follow-ups (all roles)
  *   GET    /:id/referrals     → Get patient's referrals (all roles)
  */
@@ -28,6 +29,7 @@ const {
   getPatient,
   updatePatient,
   getPatientTimeline,
+  getPatientAssessments,
   getPatientFollowUps,
   getPatientReferrals,
   listPatients,
@@ -97,6 +99,19 @@ router.put(
 router.get(
   '/:id/timeline',
   getPatientTimeline
+);
+
+// =============================================================================
+// GET PATIENT ASSESSMENTS
+// GET /api/patients/:id/assessments
+// =============================================================================
+// For the doctor dashboard: the structured forms an ASHA completed for this
+// patient, newest first. Clinical / admin roles only (field workers see their
+// own assessments on the phone).
+router.get(
+  '/:id/assessments',
+  authorize('DOCTOR', 'SPECIALIST', 'HOSPITAL_ADMIN', 'SYSTEM_ADMIN'),
+  getPatientAssessments
 );
 
 // =============================================================================
