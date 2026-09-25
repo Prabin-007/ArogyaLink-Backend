@@ -114,6 +114,7 @@ enum TimelineEventType {
   FOLLOWUP_ESCALATED          // Follow-up escalated due to worsening condition
   EMERGENCY_ESCALATED         // Emergency escalation triggered (Person 5 integration)
   HIGH_RISK_FLAGGED           // Patient's isHighRisk flag went false → true (riskReasons in description)
+  ASSESSMENT_COMPLETED        // An ASHA finished a structured assessment (triage level + reasons in description)
 }
 
 // Programme category an ASHA files a patient under (drives which checks she does).
@@ -123,6 +124,16 @@ enum PatientCategory {
   CHILD_UNDER_5   // Child health / immunisation tracking
   NCD             // Non-communicable disease (hypertension, diabetes, ...)
   ELDERLY         // Elderly care
+}
+
+// Result of a structured assessment (questionnaire) as computed BY THE PHONE with
+// the app's own rules. Not the same thing as the server-side triage engine's
+// EMERGENCY/HIGH/MEDIUM/LOW (src/services/triageService.js) — see Assessment.
+enum AssessmentTriageLevel {
+  EMERGENCY   // Act now: refer / escalate immediately
+  REFER_SOON  // Needs a facility visit soon
+  WATCH       // Keep an eye on it; re-check
+  ROUTINE     // Nothing concerning
 }
 
 // Level of the health system a facility belongs to (Person 1 & Person 4).
@@ -216,6 +227,7 @@ model User {
   patientsAssigned Patient[]     @relation("AshaToPatients")  // ASHA's assigned patients
   encounters       Encounter[]   @relation("DoctorEncounters") // Encounters created by this doctor
   vitalsRecorded   Vitals[]      @relation("RecordedByUser")   // Vitals recorded by this user
+  assessmentsRecorded Assessment[] @relation("AssessmentRecordedBy") // Assessments completed by this user
   prescriptions    Prescription[] @relation("DoctorPrescriptions")
   referralsCreated Referral[]    @relation("ReferralCreatedBy")
   referralEvents   ReferralEvent[] @relation("ReferralEventUpdatedBy")
@@ -226,6 +238,7 @@ model User {
   patientsModified   Patient[]   @relation("PatientLastModifiedBy")
   encountersModified Encounter[] @relation("EncounterLastModifiedBy")
   vitalsModified     Vitals[]    @relation("VitalsLastModifiedBy")
+  assessmentsModified Assessment[] @relation("AssessmentLastModifiedBy")
   followUpsModified  FollowUp[]  @relation("FollowUpLastModifiedBy")
 
   // Teleconsultation back-relations
@@ -270,6 +283,7 @@ model Patient {
   followUps      FollowUp[]
   timeline       TimelineEvent[]
   vitals         Vitals[]
+  assessments    Assessment[]
   prescriptions  Prescription[]
   notifications Notification[]
   teleconsultations TeleconsultationRequest[]
@@ -302,6 +316,7 @@ model Encounter {
   lastModifiedBy User?         @relation("EncounterLastModifiedBy", fields: [lastModifiedById], references: [id])
 
   vitals        Vitals[]       // Vitals recorded during this encounter
+  assessments   Assessment[]   // Assessments completed during this encounter
   prescriptions Prescription[] // Prescriptions issued during this encounter
   referrals     Referral[]     // Referrals created from this encounter
   followUps     FollowUp[]     // Follow-ups linked to this encounter
@@ -340,6 +355,58 @@ model Vitals {
   @@index([patientId])   // "Show all vitals for this patient"
   @@index([encounterId]) // "Show vitals for this encounter"
   @@map("vitals")
+}
+
+// -----------------------------------------------------------------------------
+// Assessment – a completed structured form (questionnaire) for a patient
+// -----------------------------------------------------------------------------
+// Filled in by an ASHA on the phone (e.g. formId "anc_visit", "general_screening")
+// and uploaded through POST /api/sync/upload, with the same rules as Vitals:
+// client-generated UUID id, ownership through the patient, idempotent upsert,
+// baseUpdatedAt optimistic concurrency. Doctors read them on the web.
+//
+// TWO DIFFERENT TRIAGE RESULTS LIVE ON THIS ROW — do not confuse them:
+//   triageLevel / triageReasons / score      → computed ON THE PHONE from the answers
+//                                              (AssessmentTriageLevel). Uploaded as-is.
+//   serverTriageLevel / -Score / -Reasons    → computed BY THE SERVER when the assessment
+//                                              syncs, by the existing rule engine
+//                                              (src/services/triageService.js, Person 5), from
+//                                              the patient's latest vitals + encounter symptoms.
+//                                              Its own scale: EMERGENCY | HIGH | MEDIUM | LOW.
+//                                              Never sent by the phone; null when the engine
+//                                              had no vitals or symptoms to work with.
+model Assessment {
+  id            String                @id @default(cuid()) // Client-generated UUID for records created on the phone
+  patientId     String                                     // FK → patients.id (immutable)
+  encounterId   String?                                    // FK → encounters.id (optional, immutable)
+  formId        String                                     // Which form, e.g. "anc_visit", "general_screening" (immutable)
+  formVersion   Int                                        // Version of that form's questions (immutable)
+  answers       Json                                       // question key → answer value
+  score         Int?                                       // Optional total score computed by the phone
+  triageLevel   AssessmentTriageLevel                      // Phone-computed, rule-based result
+  triageReasons String[]                                   // Phone-computed: why that level was chosen
+  completedAt   DateTime                                   // When the ASHA finished the form (phone time)
+
+  // Server-side triage (existing rule engine) — separate from the phone's result above.
+  serverTriageLevel   String?                              // EMERGENCY | HIGH | MEDIUM | LOW (triageService.js)
+  serverTriageScore   Int?
+  serverTriageReasons String[]
+
+  recordedById     String?                                 // FK → users.id: always the authenticated uploader
+  lastModifiedById String?                                 // FK → users.id: who last wrote this row (web or sync)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt                     // Server-side last-write time; used as the sync concurrency token
+
+  // Relations
+  patient        Patient    @relation(fields: [patientId], references: [id])
+  encounter      Encounter? @relation(fields: [encounterId], references: [id])
+  recordedBy     User?      @relation("AssessmentRecordedBy", fields: [recordedById], references: [id])
+  lastModifiedBy User?      @relation("AssessmentLastModifiedBy", fields: [lastModifiedById], references: [id])
+
+  @@index([patientId, completedAt]) // "Latest assessment for this patient" / newest-first listing
+  @@index([encounterId])
+  @@index([updatedAt])              // Sync download: "changed since lastSyncedAt"
+  @@map("assessments")
 }
 
 // -----------------------------------------------------------------------------
