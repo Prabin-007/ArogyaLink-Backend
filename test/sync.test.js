@@ -31,6 +31,15 @@
  *   K  lost response: create ok, response lost, edit offline, resend WITHOUT baseUpdatedAt → ok, edit applied
  *      (lastModifiedById == caller)
  *   L  a doctor edits the record, then the ASHA resends a stale version → conflict, serverRecord included
+ *
+ * Assessments (structured forms):
+ *   M  one batch (order patient→encounter→vitals→assessment), phone values kept, timeline event, idempotent retry
+ *   N  the server's own triage (existing rule engine) is stored separately from the phone's result
+ *   O  optimistic concurrency, lost response, "someone else changed it" → conflict + serverRecord
+ *   P  ownership through the patient, fixed fields, validation, per-record independence
+ *   Q  download: the ASHA's patients' assessments, incremental; existing keys unchanged
+ *   R  GET /api/patients/:id/assessments — clinical roles only, newest first by completedAt
+ *   S  GET /api/patients?triageLevel= — patients whose LATEST assessment has that level
  */
 
 require('dotenv').config();
@@ -38,11 +47,12 @@ require('dotenv').config();
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const bcrypt = require('bcryptjs');
 const { PrismaClient } = require('@prisma/client');
 
 const PORT = process.env.TEST_PORT || '3999';
 const BASE = `http://localhost:${PORT}`;
-const PASSWORD = 'Demo@1234'; // documented demo password (prisma/seed.js)
+const PASSWORD = 'Demo@123'; // demo password set by prisma/seed.js (DEMO_PASSWORD)
 
 const prisma = new PrismaClient();
 
@@ -138,10 +148,21 @@ const startServer = async () => {
 
 // ─── Test data bookkeeping (for cleanup) ──────────────────────────────────────
 const createdPatientIds = new Set();
+const createdUserIds = new Set();
+
+/** Creates a throwaway user for a role the seed does not provide, and logs in as them. Removed by cleanup(). */
+const makeWebUser = async (role) => {
+  const identifier = `TEST-${role}-${randomUUID().slice(0, 8)}`;
+  const user = await prisma.user.create({
+    data: { identifier, role, name: `Test ${role}`, phone: '9000000999', passwordHash: await bcrypt.hash(PASSWORD, 10), isActive: true },
+  });
+  createdUserIds.add(user.id);
+  return login(identifier, role);
+};
 
 const cleanup = async () => {
   const ids = [...createdPatientIds];
-  if (ids.length === 0) return;
+  if (ids.length === 0 && createdUserIds.size === 0) return;
   const referrals = await prisma.referral.findMany({ where: { patientId: { in: ids } }, select: { id: true } });
   const referralIds = referrals.map((r) => r.id);
   await prisma.timelineEvent.deleteMany({ where: { patientId: { in: ids } } });
@@ -149,9 +170,11 @@ const cleanup = async () => {
   await prisma.followUp.deleteMany({ where: { patientId: { in: ids } } });
   await prisma.prescription.deleteMany({ where: { patientId: { in: ids } } });
   await prisma.referral.deleteMany({ where: { patientId: { in: ids } } });
+  await prisma.assessment.deleteMany({ where: { patientId: { in: ids } } });
   await prisma.vitals.deleteMany({ where: { patientId: { in: ids } } });
   await prisma.encounter.deleteMany({ where: { patientId: { in: ids } } });
   await prisma.patient.deleteMany({ where: { id: { in: ids } } });
+  await prisma.user.deleteMany({ where: { id: { in: [...createdUserIds] } } });
 };
 
 // ─── The scenarios ────────────────────────────────────────────────────────────
@@ -597,6 +620,260 @@ const run = async () => {
   const lNow = await prisma.patient.findUnique({ where: { id: PL } });
   check('recovery: re-apply on top of serverRecord using its updatedAt → ok',
     l5r && l5r.status === 'ok' && lNow.phone === '9666666666' && lNow.village === 'Mulshi' && lNow.lastModifiedById === asha1.id, l5r);
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // Assessments (structured forms). Scenarios M–S.
+  // ══════════════════════════════════════════════════════════════════════════════
+  const mkPatient = (id, extra = {}) => ({
+    id, name: `Assess ${id.slice(0, 4)}`, dateOfBirth: '1990-03-03', gender: 'FEMALE',
+    village: 'Velhe', district: 'Pune', state: 'Maharashtra', ...extra,
+  });
+  const mkAssessment = (id, patientId, extra = {}) => ({
+    id, patientId, formId: 'anc_visit', formVersion: 2,
+    answers: { headache: 'severe', bp_checked: true },
+    score: 7, triageLevel: 'REFER_SOON', triageReasons: ['BP >= 140/90', 'Severe headache'],
+    completedAt: daysAgo(1), ...extra,
+  });
+  const dbAssessment = (id) => prisma.assessment.findUnique({ where: { id } });
+  const countAssessments = (patientId) => prisma.assessment.count({ where: { patientId } });
+
+  // ── M ──────────────────────────────────────────────────────────────────────
+  section('M. Assessments: one batch, the phone\'s values kept, timeline event, idempotent retry');
+  const PM = randomUUID(), EM = randomUUID(), VM = randomUUID(), AM = randomUUID();
+  createdPatientIds.add(PM);
+  const mCompleted = daysAgo(2);
+  const mAnswers = { headache: 'severe', bp_checked: true, weeks_pregnant: 30, notes: { a: 1, b: [1, 2] } };
+  const mBatch = {
+    // Listed first on purpose: the server orders by record type (…vitals → assessments…).
+    assessments: [mkAssessment(AM, PM, {
+      encounterId: EM, answers: mAnswers, completedAt: mCompleted,
+      serverTriageLevel: 'ROUTINE', // a phone must not be able to set the server's triage — stripped
+      recordedById: doctor.id, // never trusted from the payload either
+    })],
+    vitals: [{ id: VM, patientId: PM, encounterId: EM, bpSystolic: 150, bpDiastolic: 95, recordedAt: daysAgo(2) }],
+    encounters: [{ id: EM, patientId: PM, encounterType: 'HOME_VISIT', encounterDate: daysAgo(2) }],
+    patients: [mkPatient(PM)],
+  };
+  const m1 = await upload(asha1.token, mBatch);
+  check('upload returns 200 with 4 results', m1.status === 200 && m1.data?.results?.length === 4, m1.body);
+  check('processed in order patient → encounter → vitals → assessment',
+    JSON.stringify(m1.data.results.map((r) => r.type)) === JSON.stringify(['patient', 'encounter', 'vitals', 'assessment']), m1.data.results);
+  const m1a = findResult(m1, 'assessment', AM);
+  check('assessment → ok, with the new server updatedAt', m1a && m1a.status === 'ok' && !isNaN(Date.parse(m1a.updatedAt)), m1a);
+  const mRow = await dbAssessment(AM);
+  check('client UUID is the primary key; patient/encounter/form fields stored',
+    mRow && mRow.id === AM && mRow.patientId === PM && mRow.encounterId === EM && mRow.formId === 'anc_visit' && mRow.formVersion === 2, mRow);
+  check('answers (nested JSON), score, triageLevel, triageReasons stored as sent',
+    JSON.stringify(mRow.answers) === JSON.stringify(mAnswers) && mRow.score === 7 && mRow.triageLevel === 'REFER_SOON' &&
+    JSON.stringify(mRow.triageReasons) === JSON.stringify(['BP >= 140/90', 'Severe headache']), mRow);
+  check('completedAt is the PHONE\'s time, not the sync time', mRow.completedAt.getTime() === new Date(mCompleted).getTime(), mRow.completedAt);
+  check('recordedById / lastModifiedById = the authenticated ASHA (payload value ignored)',
+    mRow.recordedById === asha1.id && mRow.lastModifiedById === asha1.id, mRow);
+  check('the phone cannot set the server triage columns', mRow.serverTriageLevel !== 'ROUTINE', mRow.serverTriageLevel);
+
+  const tlM = await timelineTypes(asha1.token, PM);
+  const evM = tlM.events.filter((e) => e.eventType === 'ASSESSMENT_COMPLETED');
+  check('exactly one ASSESSMENT_COMPLETED timeline event', evM.length === 1, tlM.types);
+  check('event description carries the triage level, the reasons and the form',
+    evM[0] && /REFER_SOON/.test(evM[0].description) && /BP >= 140\/90; Severe headache/.test(evM[0].description) && /anc_visit/.test(evM[0].description), evM[0]);
+  check('event references the assessment and is stamped with the phone\'s completedAt',
+    evM[0] && evM[0].referenceId === AM && new Date(evM[0].createdAt).getTime() === new Date(mCompleted).getTime(), evM[0]);
+
+  const m2 = await upload(asha1.token, mBatch);
+  check('re-sending the identical batch → all ok', m2.data.results.length === 4 && m2.data.results.every((r) => r.status === 'ok'), m2.data.results);
+  check('...no duplicate assessment row', (await countAssessments(PM)) === 1);
+  check('...no duplicate timeline event', count((await timelineTypes(asha1.token, PM)).types, 'ASSESSMENT_COMPLETED') === 1);
+  check('...updatedAt unchanged (a pure retry writes nothing)', findResult(m2, 'assessment', AM).updatedAt === m1a.updatedAt);
+  const m3 = await upload(asha1.token, {
+    assessments: [mkAssessment(AM, PM, {
+      encounterId: EM, completedAt: mCompleted,
+      answers: { notes: { b: [1, 2], a: 1 }, weeks_pregnant: 30, bp_checked: true, headache: 'severe' }, // same content, keys reordered
+    })],
+  });
+  check('same answers with the keys in a different order → still a no-op retry',
+    findResult(m3, 'assessment', AM).status === 'ok' && findResult(m3, 'assessment', AM).updatedAt === m1a.updatedAt, m3.data.results);
+
+  // ── N ──────────────────────────────────────────────────────────────────────
+  section('N. The server\'s own triage (existing rule engine) is stored SEPARATELY from the phone\'s result');
+  const PN1 = randomUUID(), VN1 = randomUUID(), AN1 = randomUUID();
+  const PN2 = randomUUID(), EN2 = randomUUID(), AN2 = randomUUID();
+  const PN3 = randomUUID(), AN3 = randomUUID();
+  [PN1, PN2, PN3].forEach((p) => createdPatientIds.add(p));
+  const n1 = await upload(asha1.token, {
+    patients: [mkPatient(PN1), mkPatient(PN2), mkPatient(PN3)],
+    encounters: [{ id: EN2, patientId: PN2, encounterType: 'HOME_VISIT', symptoms: ['Unconscious'] }],
+    vitals: [{ id: VN1, patientId: PN1, bpSystolic: 190, bpDiastolic: 125, oxygenSaturation: 90 }],
+    assessments: [
+      mkAssessment(AN1, PN1, { triageLevel: 'WATCH', triageReasons: ['Phone thinks: watch'] }),
+      mkAssessment(AN2, PN2, { encounterId: EN2, triageLevel: 'ROUTINE', triageReasons: [] }),
+      mkAssessment(AN3, PN3, { triageLevel: 'ROUTINE', triageReasons: [] }),
+    ],
+  });
+  check('all records ok', n1.data.results.length === 8 && n1.data.results.every((r) => r.status === 'ok'), n1.data.results);
+  const n1a = await dbAssessment(AN1);
+  check('vitals-based: server triage HIGH with its own reasons, from the batch\'s vitals (they sync first)',
+    n1a.serverTriageLevel === 'HIGH' && n1a.serverTriageScore === 5 && n1a.serverTriageReasons.includes('Low oxygen saturation'), n1a);
+  check('...while the phone\'s result is untouched and on a different scale',
+    n1a.triageLevel === 'WATCH' && JSON.stringify(n1a.triageReasons) === JSON.stringify(['Phone thinks: watch']), n1a);
+  const n1b = await dbAssessment(AN2);
+  check('symptom-based (linked encounter): red flag → EMERGENCY with the flag in the reasons',
+    n1b.serverTriageLevel === 'EMERGENCY' && n1b.serverTriageReasons.includes('Red flag: unconscious'), n1b);
+  check('...and the phone still says ROUTINE', n1b.triageLevel === 'ROUTINE');
+  const n1c = await dbAssessment(AN3);
+  check('nothing to assess (no vitals, no symptoms) → null, not a made-up LOW',
+    n1c.serverTriageLevel === null && n1c.serverTriageScore === null && n1c.serverTriageReasons.length === 0, n1c);
+  check('syncing an assessment does NOT create a referral (that stays a doctor\'s action)',
+    (await prisma.referral.count({ where: { patientId: { in: [PN1, PN2, PN3] } } })) === 0);
+
+  // ── O ──────────────────────────────────────────────────────────────────────
+  section('O. Optimistic concurrency, same rules as vitals (baseUpdatedAt, lost response, someone else)');
+  const oEdit = await upload(asha1.token, { assessments: [{ id: AM, answers: { ...mAnswers, headache: 'mild' }, triageLevel: 'WATCH', baseUpdatedAt: m1a.updatedAt }] });
+  const oEditR = findResult(oEdit, 'assessment', AM);
+  check('edit with the right baseUpdatedAt → ok and a NEW updatedAt', oEditR.status === 'ok' && oEditR.updatedAt !== m1a.updatedAt, oEditR);
+  const oRow = await dbAssessment(AM);
+  check('...answers and triageLevel changed; fixed fields untouched',
+    oRow.answers.headache === 'mild' && oRow.triageLevel === 'WATCH' && oRow.formId === 'anc_visit' && oRow.encounterId === EM && oRow.lastModifiedById === asha1.id, oRow);
+  check('...an edit does not add another timeline event', count((await timelineTypes(asha1.token, PM)).types, 'ASSESSMENT_COMPLETED') === 1);
+
+  const oStale = await upload(asha1.token, { assessments: [{ id: AM, score: 99, baseUpdatedAt: m1a.updatedAt }] });
+  const oStaleR = findResult(oStale, 'assessment', AM);
+  check('stale baseUpdatedAt → conflict, nothing overwritten',
+    oStaleR.status === 'conflict' && (await dbAssessment(AM)).score === 7, oStaleR);
+  check('conflict carries serverRecord = the server\'s current row',
+    oStaleR.serverRecord && oStaleR.serverRecord.id === AM && oStaleR.serverRecord.answers.headache === 'mild' && oStaleR.updatedAt === oStaleR.serverRecord.updatedAt, oStaleR);
+  const dlShape = (await download(asha1.token, '0')).data.assessments.find((x) => x.id === AM);
+  check('serverRecord has the same fields as a downloaded assessment',
+    JSON.stringify(Object.keys(oStaleR.serverRecord).sort()) === JSON.stringify(Object.keys(dlShape).sort()));
+
+  const oLost = await upload(asha1.token, { assessments: [{ id: AM, score: 8 }] });
+  check('lost response (NO baseUpdatedAt, ASHA was the last writer) → edit applied',
+    findResult(oLost, 'assessment', AM).status === 'ok' && (await dbAssessment(AM)).score === 8, oLost.data.results);
+
+  await prisma.assessment.update({ where: { id: AM }, data: { lastModifiedById: doctor.id } });
+  const oOther = await upload(asha1.token, { assessments: [{ id: AM, score: 9 }] });
+  const oOtherR = findResult(oOther, 'assessment', AM);
+  check('someone else last modified it and no baseUpdatedAt → conflict with serverRecord',
+    oOtherR.status === 'conflict' && oOtherR.serverRecord && oOtherR.serverRecord.lastModifiedById === doctor.id && (await dbAssessment(AM)).score === 8, oOtherR);
+
+  // ── P ──────────────────────────────────────────────────────────────────────
+  section('P. Ownership through the patient, fixed fields, validation, per-record independence');
+  const p1 = await upload(asha2.token, { assessments: [{ id: AM, score: 1 }] });
+  check('ANOTHER ASHA cannot update the assessment → error (same message as "not found")',
+    findResult(p1, 'assessment', AM).status === 'error' && /not found or is not assigned/.test(findResult(p1, 'assessment', AM).message), p1.data.results);
+  const p2 = await upload(asha2.token, { assessments: [mkAssessment(randomUUID(), PM)] });
+  check('ANOTHER ASHA cannot create an assessment for this patient → error', p2.data.results[0].status === 'error', p2.data.results);
+  check('...and nothing was written', (await countAssessments(PM)) === 1);
+
+  const fresh = await dbAssessment(AM);
+  for (const [field, value, re] of [
+    ['formId', 'general_screening', /formId cannot be changed/],
+    ['formVersion', 3, /formVersion cannot be changed/],
+    ['patientId', PN1, /patientId cannot be changed/],
+    ['encounterId', null, /encounterId cannot be changed/],
+  ]) {
+    const r = findResult(await upload(asha1.token, { assessments: [{ id: AM, [field]: value, baseUpdatedAt: fresh.updatedAt.toISOString() }] }), 'assessment', AM);
+    check(`changing ${field} on an existing assessment → error`, r.status === 'error' && re.test(r.message), r);
+  }
+  const p3 = await upload(asha1.token, { assessments: [mkAssessment(randomUUID(), PM, { encounterId: E })] });
+  check('encounter belonging to another patient → error', p3.data.results[0].status === 'error' && /does not exist for this patient/.test(p3.data.results[0].message), p3.data.results);
+  const p4 = await upload(asha1.token, { assessments: [{ id: randomUUID(), patientId: PM }] });
+  check('new assessment missing required fields → error naming them',
+    p4.data.results[0].status === 'error' && /formId/.test(p4.data.results[0].message) && /answers/.test(p4.data.results[0].message) &&
+    /triageLevel/.test(p4.data.results[0].message) && /completedAt/.test(p4.data.results[0].message), p4.data.results);
+  const p5 = await upload(asha1.token, { assessments: [mkAssessment(randomUUID(), PM, { triageLevel: 'HIGH' })] });
+  check('triageLevel must be EMERGENCY|REFER_SOON|WATCH|ROUTINE (the server\'s HIGH is not valid here)',
+    p5.data.results[0].status === 'error' && /triageLevel/.test(p5.data.results[0].message), p5.data.results);
+  const p6 = await upload(asha1.token, { assessments: [mkAssessment(randomUUID(), PM, { answers: ['not', 'an', 'object'] })] });
+  check('answers must be an object (key → value)', p6.data.results[0].status === 'error' && /answers/.test(p6.data.results[0].message), p6.data.results);
+  const p7 = await upload(asha1.token, { assessments: [mkAssessment('not-a-uuid', PM)] });
+  check('malformed id → per-record validation error', p7.data.results[0].status === 'error', p7.data.results);
+  const p8 = await upload(asha1.token, { assessments: [mkAssessment('cabcdefghijklmnopqrstuvwx', PM)] });
+  check('a NEW assessment needs a UUID id (a server-style id is refused)', p8.data.results[0].status === 'error' && /UUID/.test(p8.data.results[0].message), p8.data.results);
+  const goodId = randomUUID();
+  const p9 = await upload(asha1.token, { assessments: [mkAssessment(randomUUID(), PM, { formVersion: 0 }), mkAssessment(goodId, PM, { completedAt: daysAgo(4) })] });
+  check('one bad assessment does not block a good one in the same batch',
+    p9.data.results[0].status === 'error' && p9.data.results[1].status === 'ok', p9.data.results);
+
+  // ── Q ──────────────────────────────────────────────────────────────────────
+  section('Q. Download: the ASHA\'s patients\' assessments, incremental, and the existing keys are unchanged');
+  const q1 = await download(asha1.token, '0');
+  const q1a = q1.data.assessments.find((x) => x.id === AM);
+  check('download has an "assessments" array', Array.isArray(q1.data.assessments));
+  check('full object: answers, both triage results, ids and timestamps',
+    q1a && q1a.answers.headache === 'mild' && q1a.triageLevel === 'WATCH' && 'serverTriageLevel' in q1a && 'serverTriageReasons' in q1a &&
+    q1a.patientId === PM && q1a.recordedById === asha1.id && !!q1a.updatedAt && !!q1a.completedAt, q1a);
+  check('a record for each of this ASHA\'s patients is present', [AN1, AN2, AN3].every((id) => q1.data.assessments.some((x) => x.id === id)));
+  check('another ASHA does NOT receive them', !(await download(asha2.token, '0')).data.assessments.some((x) => x.id === AM || x.id === AN1));
+  check('every pre-existing download key is still there (additive change only)',
+    ['serverTimestamp', 'deviceId', 'patients', 'encounters', 'vitals', 'prescriptions', 'referrals', 'followups', 'facilities'].every((k) => k in q1.data));
+  const q2 = await download(asha1.token, q1.data.serverTimestamp);
+  check('with an up-to-date lastSyncedAt → no assessments', q2.data.assessments.length === 0, q2.data.assessments.length);
+  const stamp = q1.data.serverTimestamp;
+  await upload(asha1.token, { assessments: [{ id: goodId, score: 3 }] }); // ASHA is the last writer → applied
+  const q3 = await download(asha1.token, stamp);
+  check('an updated assessment appears in the next incremental download', q3.data.assessments.some((x) => x.id === goodId && x.score === 3), q3.data.assessments.map((x) => x.id));
+
+  // ── R ──────────────────────────────────────────────────────────────────────
+  section('R. GET /api/patients/:id/assessments — clinical roles only, newest first');
+  const hadmin = await makeWebUser('HOSPITAL_ADMIN');
+  const specialist = await makeWebUser('SPECIALIST');
+  const sysadmin = await makeWebUser('SYSTEM_ADMIN');
+  // Sync the NEWER assessment first, then an OLDER one: "newest first" must follow completedAt, not arrival order.
+  const PR = randomUUID(), RNew = randomUUID(), ROld = randomUUID();
+  createdPatientIds.add(PR);
+  await upload(asha1.token, { patients: [mkPatient(PR)], assessments: [mkAssessment(RNew, PR, { triageLevel: 'ROUTINE', triageReasons: [], completedAt: daysAgo(1) })] });
+  await upload(asha1.token, { assessments: [mkAssessment(ROld, PR, { triageLevel: 'REFER_SOON', completedAt: daysAgo(6) })] });
+  const r1 = await api('GET', `/api/patients/${PR}/assessments`, doctor.token);
+  check('a DOCTOR gets 200', r1.status === 200, r1.body);
+  check('response: { patientId, assessments[] }', r1.data.patientId === PR && Array.isArray(r1.data.assessments), r1.body);
+  check('newest first by completedAt (not by when they synced)',
+    r1.data.assessments.length === 2 && r1.data.assessments[0].id === RNew && r1.data.assessments[1].id === ROld, r1.data.assessments.map((x) => x.id));
+  check('each item has the phone\'s triage, the server\'s triage and who recorded it',
+    r1.data.assessments[1].triageLevel === 'REFER_SOON' && 'serverTriageLevel' in r1.data.assessments[1] && r1.data.assessments[1].recordedBy?.id === asha1.id, r1.data.assessments[1]);
+  check('SPECIALIST, HOSPITAL_ADMIN and SYSTEM_ADMIN are allowed',
+    (await api('GET', `/api/patients/${PR}/assessments`, specialist.token)).status === 200 &&
+    (await api('GET', `/api/patients/${PR}/assessments`, hadmin.token)).status === 200 &&
+    (await api('GET', `/api/patients/${PR}/assessments`, sysadmin.token)).status === 200);
+  check('an ASHA gets 403', (await api('GET', `/api/patients/${PR}/assessments`, asha1.token)).status === 403);
+  check('no token → 401', (await api('GET', `/api/patients/${PR}/assessments`)).status === 401);
+  check('unknown patient → 404', (await api('GET', `/api/patients/${randomUUID()}/assessments`, doctor.token)).status === 404);
+  const rEmpty = await api('GET', `/api/patients/${PN3}/assessments`, doctor.token);
+  check('a patient with one assessment returns exactly that one', rEmpty.status === 200 && rEmpty.data.assessments.length === 1);
+
+  // ── S ──────────────────────────────────────────────────────────────────────
+  section('S. GET /api/patients?triageLevel= — patients whose LATEST assessment has that level');
+  // PS_A: older REFER_SOON, newer ROUTINE  → latest is ROUTINE
+  // PS_B: newer REFER_SOON synced FIRST, older ROUTINE synced later → latest is REFER_SOON (completedAt, not arrival)
+  // PS_C: no assessments at all
+  const PS_A = randomUUID(), PS_B = randomUUID(), PS_C = randomUUID();
+  [PS_A, PS_B, PS_C].forEach((p) => createdPatientIds.add(p));
+  await upload(asha1.token, {
+    patients: [mkPatient(PS_A), mkPatient(PS_B), mkPatient(PS_C)],
+    assessments: [
+      mkAssessment(randomUUID(), PS_A, { triageLevel: 'REFER_SOON', completedAt: daysAgo(5) }),
+      mkAssessment(randomUUID(), PS_A, { triageLevel: 'ROUTINE', triageReasons: [], completedAt: daysAgo(1) }),
+      mkAssessment(randomUUID(), PS_B, { triageLevel: 'REFER_SOON', completedAt: daysAgo(1) }),
+    ],
+  });
+  await upload(asha1.token, { assessments: [mkAssessment(randomUUID(), PS_B, { triageLevel: 'ROUTINE', triageReasons: [], completedAt: daysAgo(7) })] });
+  const ids = (resp) => resp.data.patients.map((p) => p.id);
+  const s1 = await api('GET', '/api/patients?triageLevel=REFER_SOON&limit=100', doctor.token);
+  check('?triageLevel=REFER_SOON → 200', s1.status === 200, s1.body);
+  check('includes the patient whose latest is REFER_SOON, even though a later-synced older one says ROUTINE', ids(s1).includes(PS_B), ids(s1));
+  check('excludes the patient whose EARLIER assessment was REFER_SOON but latest is ROUTINE', !ids(s1).includes(PS_A));
+  check('excludes patients with no assessment', !ids(s1).includes(PS_C));
+  check('every returned patient really has REFER_SOON as their latest',
+    (await Promise.all(ids(s1).map((id) => prisma.assessment.findFirst({ where: { patientId: id }, orderBy: [{ completedAt: 'desc' }, { createdAt: 'desc' }] })))).every((a) => a && a.triageLevel === 'REFER_SOON'));
+  check('pagination block is still returned', s1.data.pagination && s1.data.pagination.total === ids(s1).length, s1.data.pagination);
+  const s2 = await api('GET', '/api/patients?triageLevel=ROUTINE&limit=100', doctor.token);
+  check('?triageLevel=ROUTINE → PS_A yes, PS_B no', ids(s2).includes(PS_A) && !ids(s2).includes(PS_B), ids(s2));
+  const s3 = await api('GET', `/api/patients?triageLevel=EMERGENCY&assignedAshaId=${asha2.id}&limit=100`, doctor.token);
+  check('combines with the other filters (nothing for ASHA 2)', s3.status === 200 && s3.data.patients.length === 0, s3.body);
+  check('an unknown level → 400 listing the valid ones',
+    (await api('GET', '/api/patients?triageLevel=HIGH', doctor.token)).status === 400 && /REFER_SOON/.test((await api('GET', '/api/patients?triageLevel=urgent', doctor.token)).body.message));
+  const s4 = await api('GET', '/api/patients?limit=100', doctor.token);
+  check('WITHOUT the parameter the list is unchanged: all three patients present', [PS_A, PS_B, PS_C].every((id) => ids(s4).includes(id)), ids(s4).length);
+  check('...with the same response shape', Object.keys(s4.data).sort().join() === 'pagination,patients' && s4.data.patients[0].assignedAsha !== undefined);
 };
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
