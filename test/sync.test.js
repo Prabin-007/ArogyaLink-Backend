@@ -47,6 +47,7 @@ require('dotenv').config();
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { isDeepStrictEqual } = require('node:util');
 const bcrypt = require('bcryptjs');
 const { PrismaClient } = require('@prisma/client');
 
@@ -663,8 +664,9 @@ const run = async () => {
   const mRow = await dbAssessment(AM);
   check('client UUID is the primary key; patient/encounter/form fields stored',
     mRow && mRow.id === AM && mRow.patientId === PM && mRow.encounterId === EM && mRow.formId === 'anc_visit' && mRow.formVersion === 2, mRow);
+  // Deep (order-independent) comparison: Postgres jsonb does not preserve object key order.
   check('answers (nested JSON), score, triageLevel, triageReasons stored as sent',
-    JSON.stringify(mRow.answers) === JSON.stringify(mAnswers) && mRow.score === 7 && mRow.triageLevel === 'REFER_SOON' &&
+    isDeepStrictEqual(mRow.answers, mAnswers) && mRow.score === 7 && mRow.triageLevel === 'REFER_SOON' &&
     JSON.stringify(mRow.triageReasons) === JSON.stringify(['BP >= 140/90', 'Severe headache']), mRow);
   check('completedAt is the PHONE\'s time, not the sync time', mRow.completedAt.getTime() === new Date(mCompleted).getTime(), mRow.completedAt);
   check('recordedById / lastModifiedById = the authenticated ASHA (payload value ignored)',
