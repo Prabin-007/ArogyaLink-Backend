@@ -128,27 +128,27 @@ const facilityRoutes = require('./routes/facilities');
 app.use('/api/facilities',   facilityRoutes);
 app.use('/facilities',       facilityRoutes);
 
-// ── Medicines & Medicine Availability (Person 6) ──────────────────────────────
+// ── Medicines & Medicine Availability ─────────────────────────────────────────
 const medicineRoutes = require('./routes/medicines');
 app.use('/api/medicines',    medicineRoutes);
 app.use('/medicines',        medicineRoutes);
 
-// ── Service Catalog & Service Availability (Person 6) ─────────────────────────
+// ── Service Catalog & Service Availability ────────────────────────────────────
 const serviceRoutes = require('./routes/services');
 app.use('/api/services',     serviceRoutes);
 app.use('/services',         serviceRoutes);
 
-// ── Diagnostic Catalog & Diagnostic Availability (Person 6) ───────────────────
+// ── Diagnostic Catalog & Diagnostic Availability ──────────────────────────────
 const diagnosticRoutes = require('./routes/diagnostics');
 app.use('/api/diagnostics',  diagnosticRoutes);
 app.use('/diagnostics',      diagnosticRoutes);
 
-// ── Notification System (Person 6) ────────────────────────────────────────────
+// ── Notification System ───────────────────────────────────────────────────────
 const notificationRoutes = require('./routes/notifications');
 app.use('/api/notifications', notificationRoutes);
 app.use('/notifications',     notificationRoutes);
 
-// ── Resource Multi-Availability (Person 6) ────────────────────────────────────
+// ── Resource Multi-Availability ───────────────────────────────────────────────
 const resourceRoutes = require('./routes/resources');
 app.use('/api/resources',    resourceRoutes);
 app.use('/resources',        resourceRoutes);
@@ -159,7 +159,7 @@ const syncRoutes = require('./routes/sync');
 app.use('/api/sync',          syncRoutes);
 app.use('/sync',              syncRoutes);
 
-// ── Teleconsultation (WebRTC + Socket.io - Person 2) ───────────────────────────
+// ── Teleconsultation (WebRTC + Socket.io) ─────────────────────────────────────
 const teleconsultationRoutes = require('./routes/teleconsultationRoutes');
 const teleconsultDoctorsRoutes = require('./routes/teleconsultDoctorsRoutes');
 app.use('/api/teleconsultations',   teleconsultationRoutes);
